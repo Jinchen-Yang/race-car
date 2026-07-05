@@ -86,11 +86,13 @@ extern volatile uint32_t g_tick_ms;
 #define SERVO_PAN_MID     90.0f  /* 待整定: 云台 PAN 中位角(占位) */
 #define SERVO_TILT_MID    90.0f  /* 待整定: 云台 TILT 中位角(占位) */
 
-/* ===== 运行模式(F4: 按键选模式; IDLE 态按 MODE 键循环, RUN 灯闪"模式号"次指示) =====
+/* ===== 运行模式(F4: 按键/串口选模式; IDLE 态 MODE 键循环或串口发'1'~'4', RUN 灯闪"模式号"次) =====
  * 1 = F1 自动巡迹一圈回 A 停车(≤30s)
  * 2 = F2 定点瞄准(静止, 5s 内对靶)
- * 3 = F3 巡迹到靶联动(B 停车对靶 -> C/D 过点声光 -> 回 A 停车, ≤40s) */
-#define APP_MODE_MAX      3
+ * 3 = F3 巡迹到靶联动(B 停车对靶 -> C/D 过点声光 -> 回 A 停车, ≤40s)
+ * 4 = 发挥3 四圈连跑(每圈过 A 声光计圈, 跑满 4 圈停车) */
+#define APP_MODE_MAX      4
+#define APP_LAPS_MODE4    4      /* 发挥3 要求的连跑圈数 */
 
 /* --- 关键点顺序门限表(B,C,D,A; 双条件"都超过"才判到点; 全部待整定) ---
  * 场地 = 2024H 同款(题目 Figure1 标注): A→B 直线, B→C 半弧(累计+180°), C→D 直线, D→A 半弧(+360°)。
@@ -150,6 +152,12 @@ static float   g_lap_yaw0 = 0.0f;   /**< 出发瞬间航向(°), 累计净转角
 static int32_t g_lap_odo0 = 0;      /**< 出发瞬间右轮累计计数, 累计里程的零点 */
 static uint8_t g_run_mode = 1;      /**< 运行模式 1..APP_MODE_MAX(IDLE 态 MODE 键循环) */
 static uint8_t g_kp_idx   = 0;      /**< 关键点序列进度: 0=还没到B ... 4=已回A */
+static uint8_t g_lap_count = 0;     /**< 已完成圈数(模式4 四圈连跑用) */
+
+/* --- 在线调参副本(串口实时调, #define 只当默认值; 现场整定免重编译烧录) --- */
+static float g_track_kp   = TRACK_KP;    /**< 循迹外环 KP(运行时可调) */
+static float g_track_kd   = TRACK_KD;    /**< 循迹外环 KD(运行时可调) */
+static int   g_base_speed = BASE_SPEED;  /**< 巡迹基速 mm/s(运行时可调) */
 static uint8_t g_aim_return_run = 0;/**< AIM 结束后回 RUN(F3 中途对靶)还是进 STOP(F2) */
 static int32_t g_run_beep_ms = 0;   /**< RUN 态过点声光剩余时长(ms), 非阻塞关断 */
 
@@ -333,9 +341,9 @@ void track_loop_step(void)
     }
 
     /* 串级: 基速 ± 转向量 -> 左右目标速度(带安装符号补偿); 写给内环执行。
-     * ⚠ WHEEL_SIGN_L/R 现场标定(镜像安装可能其一取反)。 */
-    g_vel_tgt_l = (float)(WHEEL_SIGN_L * (BASE_SPEED - turn));
-    g_vel_tgt_r = (float)(WHEEL_SIGN_R * (BASE_SPEED + turn));
+     * ⚠ WHEEL_SIGN_L/R 现场标定(镜像安装可能其一取反)。基速用运行时副本(串口可调)。 */
+    g_vel_tgt_l = (float)(WHEEL_SIGN_L * (g_base_speed - turn));
+    g_vel_tgt_r = (float)(WHEEL_SIGN_R * (g_base_speed + turn));
 }
 
 /* ============================================================================
@@ -466,6 +474,7 @@ void app_fsm_step(void)
             g_vel_tgt_l = g_vel_tgt_r = 0.0f;
             g_lost_dist = 0;
             g_kp_idx = 0;
+            g_lap_count = 0;
             g_run_beep_ms = 0;
             /* 关键点判定基准快照: 以"此刻"的航向/里程为零点(见 keypoint_event) */
             g_lap_yaw0 = imu_get_yaw();
@@ -496,8 +505,18 @@ void app_fsm_step(void)
         {
             int kp = keypoint_event();
             if (kp == 4) {
-                /* 回到 A: 完赛停车(F1/F3 共用; STOP 入态自带声光) */
-                g_state = APP_ST_STOP;
+                if (g_run_mode == 4u && (g_lap_count + 1u) < APP_LAPS_MODE4) {
+                    /* 发挥3 四圈连跑: 过 A 计圈+声光, 重置基准继续跑 */
+                    g_lap_count++;
+                    beep_on();
+                    g_run_beep_ms = KEYPOINT_BEEP_MS;
+                    g_lap_yaw0 = imu_get_yaw();
+                    g_lap_odo0 = enc_get_count(ENC_RIGHT);
+                    g_kp_idx = 0;
+                } else {
+                    /* 回到 A: 完赛停车(F1/F3/第4圈共用; STOP 入态自带声光) */
+                    g_state = APP_ST_STOP;
+                }
             } else if (kp == 1 && g_run_mode == 3u) {
                 /* F3 到 B: 声光 + 停车对靶作业, 结束后回 RUN 续跑 */
                 beep_on();
@@ -590,15 +609,74 @@ app_state_e app_get_state(void)
 
 void app_mode_cycle(void)
 {
-    /* 只允许待机态换模式(运动中换模式没有安全语义); 1→2→3→1 循环 */
+    /* 只允许待机态换模式(运动中换模式没有安全语义); 1→2→...→APP_MODE_MAX→1 循环 */
     if (g_state == APP_ST_IDLE) {
         g_run_mode = (uint8_t)(g_run_mode % APP_MODE_MAX) + 1u;
+    }
+}
+
+void app_mode_set(uint8_t mode)
+{
+    /* 串口直设模式(F4 "串口设定运行模式"); 同样只在待机态生效 */
+    if (g_state == APP_ST_IDLE && mode >= 1u && mode <= APP_MODE_MAX) {
+        g_run_mode = mode;
     }
 }
 
 uint8_t app_get_mode(void)
 {
     return g_run_mode;
+}
+
+void app_estop_ack(void)
+{
+    /* 急停软清障: ESTOP 态下 2 秒内连按 3 次 START -> 回待机(红灯灭)。
+     * 用"连按三次"作确认动作, 防误触; 清障后执行器仍全停, 需重新 START 才动。 */
+    static uint8_t  s_cnt = 0;
+    static uint32_t s_first_ms = 0;
+
+    if (g_state != APP_ST_ESTOP) {
+        s_cnt = 0;
+        return;
+    }
+    if (s_cnt == 0u || (g_tick_ms - s_first_ms) > 2000u) {
+        s_cnt = 1u;                 /* 窗口过期/首次: 重新开窗计数 */
+        s_first_ms = g_tick_ms;
+        return;
+    }
+    s_cnt++;
+    if (s_cnt >= 3u) {
+        s_cnt = 0;
+        led_err_set(0);
+        g_state = APP_ST_IDLE;      /* 清障回待机; IDLE 态会保持电机停 */
+    }
+}
+
+void app_tune_step(char which, int dir)
+{
+    /* 串口在线调参(现场整定免重编译): 'p'=循迹KP ±0.05, 'd'=KD ±0.25, 'v'=基速 ±25mm/s。
+     * KP/KD 直接热改 g_pid_track 的增益字段, 下一拍外环立即生效。 */
+    float d = (dir >= 0) ? 1.0f : -1.0f;
+    if (which == 'p') {
+        g_track_kp += 0.05f * d;
+        if (g_track_kp < 0.0f) g_track_kp = 0.0f;
+        g_pid_track.kp = g_track_kp;
+    } else if (which == 'd') {
+        g_track_kd += 0.25f * d;
+        if (g_track_kd < 0.0f) g_track_kd = 0.0f;
+        g_pid_track.kd = g_track_kd;
+    } else if (which == 'v') {
+        g_base_speed += (dir >= 0) ? 25 : -25;
+        if (g_base_speed < 100) g_base_speed = 100;   /* 下限: 太慢测速量化差 */
+        if (g_base_speed > 600) g_base_speed = 600;   /* 上限: 未整定前安全帽 */
+    }
+}
+
+void app_tune_get(float *kp, float *kd, int *base)
+{
+    if (kp)   *kp   = g_track_kp;
+    if (kd)   *kd   = g_track_kd;
+    if (base) *base = g_base_speed;
 }
 
 void app_get_vel_debug(float *tgt_l, float *meas_l, float *tgt_r, float *meas_r)
@@ -628,7 +706,7 @@ void app_init(void)
 {
     /* ⚠ 占位增益, 必须真车整定(test_plan §B/§C)。
      * 外环位置式: 偏差->转向量; 内环增量式: 速度->占空增量。 */
-    pid_init(&g_pid_track, TRACK_KP, 0.0f, TRACK_KD,
+    pid_init(&g_pid_track, g_track_kp, 0.0f, g_track_kd,   /* 用运行时副本(串口可调) */
              -TRACK_OUT_LIM, TRACK_OUT_LIM, 0.0f);          /* 外环(位置式) */
     pid_init(&g_pid_vel_l, VEL_KP, VEL_KI, VEL_KD,
              VEL_OUT_MIN, VEL_OUT_MAX, VEL_INTEG_MAX);       /* 内环左(增量式) */

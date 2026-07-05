@@ -101,12 +101,58 @@ static void task_key(void)
 {
     key_scan();
     if (key_pressed(KEY_START)) {
-        if (app_get_state() == APP_ST_IDLE) app_start_request();
-        else                                app_estop();
+        app_state_e st = app_get_state();
+        if (st == APP_ST_IDLE)        app_start_request();
+        else if (st == APP_ST_ESTOP)  app_estop_ack();   /* 急停软清障: 2s 内连按 3 次回待机 */
+        else                          app_estop();
     }
     if (key_pressed(KEY_MODE)) {
         if (app_get_state() == APP_ST_IDLE) app_mode_cycle();
         else                                app_estop();
+    }
+}
+
+/* 串口命令台(F4 "串口设定运行模式与参数"): 复用 UART0(VOFA 那条线)的接收方向,
+ * 在 VOFA 的发送框里敲单字符命令即可(结尾的\r\n会被忽略)。
+ *   '1'~'4' = 设模式(仅待机) | 's' = 启动(仅待机) | 'x' = 急停(任何时候)
+ *   'P'/'p' = 循迹 KP 增/减  | 'D'/'d' = KD 增/减 | 'V'/'v' = 基速增/减 | '?' = 报状态
+ * UART0 未开 RX 中断: 靠 10ms 轮询 + 硬件 RX FIFO 缓冲, 手敲命令绰绰有余。 */
+static void cmd_print_status(void)
+{
+    float kp, kd; int base;
+    app_tune_get(&kp, &kd, &base);
+    uart_puts("[CMD] st=");   uart_print_u32((uint32_t)app_get_state());
+    uart_puts(" md=");        uart_print_u32((uint32_t)app_get_mode());
+    uart_puts(" KPx100=");    uart_print_u32((uint32_t)(kp * 100.0f + 0.5f));
+    uart_puts(" KDx100=");    uart_print_u32((uint32_t)(kd * 100.0f + 0.5f));
+    uart_puts(" V=");         uart_print_u32((uint32_t)base);
+    uart_puts("\r\n");
+}
+static void task_cmd(void)
+{
+    while (!DL_UART_isRXFIFOEmpty(UART_VOFA_INST)) {
+        uint8_t c = DL_UART_receiveData(UART_VOFA_INST);
+        switch (c) {
+        case '1': case '2': case '3': case '4':
+            app_mode_set((uint8_t)(c - '0'));
+            cmd_print_status();
+            break;
+        case 's':
+            if (app_get_state() == APP_ST_IDLE) { app_start_request(); uart_puts("[CMD] start\r\n"); }
+            break;
+        case 'x':
+            app_estop();
+            uart_puts("[CMD] ESTOP\r\n");
+            break;
+        case 'P': app_tune_step('p', +1); cmd_print_status(); break;
+        case 'p': app_tune_step('p', -1); cmd_print_status(); break;
+        case 'D': app_tune_step('d', +1); cmd_print_status(); break;
+        case 'd': app_tune_step('d', -1); cmd_print_status(); break;
+        case 'V': app_tune_step('v', +1); cmd_print_status(); break;
+        case 'v': app_tune_step('v', -1); cmd_print_status(); break;
+        case '?': cmd_print_status(); break;
+        default:  break;   /* \r \n 及未知字符: 静默忽略 */
+        }
     }
 }
 
@@ -199,6 +245,7 @@ static void task_vofa(void)
 static task_t g_tasks[] = {
     { task_heartbeat, 500, 500, 0 },
     { task_key,        10,  10, 0 },
+    { task_cmd,        10,  10, 0 },   /* 串口命令台(UART0 RX 轮询, F4 串口设模式/参数) */
     { task_k230,        5,   5, 0 },
     { task_imu,        10,  10, 0 },   /* IMU 航向积分(唯一推进点), 排在用它的 track/fsm 之前 */
     { task_vel,        10,  10, 0 },   /* = APP_VEL_DT_MS */
@@ -333,7 +380,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [tune-r8: IMU boot self-check] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r9: serial-cmd+4laps+estop-ack+live-tune] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
