@@ -121,13 +121,15 @@ uint8_t app_get_mode(void);
 void app_estop_ack(void);
 
 /**
- * @brief 串口在线调参一步: which='p'(循迹KP,±0.05) / 'd'(KD,±0.25) / 'v'(基速,±25mm/s), dir=±1
- * @note  KP/KD 热改 g_pid_track, 下一拍生效; 基速带 [100,600] 安全夹。现场整定免重编译。
+ * @brief 串口在线调参一步: which='p'(循迹KP,±0.05) / 'd'(KD,±0.25) / 'v'(基速,±25mm/s)
+ *        / 'h'(盲走航向锁KP,±0.5,唯一允许负值项), dir=±1
+ * @note  KP/KD 热改 g_pid_track, 下一拍生效; 基速带 [100,600] 安全夹; 航向KP夹±10。
+ *        现场整定免重编译。
  */
 void app_tune_step(char which, int dir);
 
-/** @brief 读当前在线调参值(kp/kd/基速), 供串口命令台 '?' 回显 */
-void app_tune_get(float *kp, float *kd, int *base);
+/** @brief 读当前在线调参值(kp/kd/基速/航向kp), 供串口命令台 '?' 回显; 不需要的传 NULL */
+void app_tune_get(float *kp, float *kd, int *base, float *hkp);
 
 /**
  * @brief 读取速度内环调试快照(目标/实测速度, 单位 mm/s), 给 VOFA 波形用

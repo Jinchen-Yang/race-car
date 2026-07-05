@@ -71,10 +71,11 @@ extern volatile uint32_t g_tick_ms;
 #define WHEEL_SIGN_R     (+1)    /* 待整定: 右轮目标速度符号(占位, 可能取反) */
 
 /* --- 丢线盲走(IMU 航向锁定) --- */
-#define HEADING_KP        0.0f   /* r7 暂时禁用(回到盲走直行): ⚠ +3/-3 两个符号都打转 —— 线性回路
-                                  * 只有一个符号会发散, 两向皆疯说明疯的是航向反馈本身(头号嫌疑:
-                                  * 摔机后某些开机 IMU 校准未过, yaw 持续漂移, 航向锁追着漂移参考跑)。
-                                  * 待 ch12 静止漂移率/转90°响应两项体检通过后再启用并定符号。 */
+#define HEADING_KP        0.0f   /* 开机默认 0(=盲走纯直行)。r12 起为运行时变量 g_heading_kp,
+                                  * 串口 'H'/'h' ±0.5 在线调(允许负值, 符号判据见 track_blind_turn)。
+                                  * 历史: r5-r7 时代 ±3 两个符号都打转 —— 当时无开机漂移自检,
+                                  * 摔机后 yaw 快漂, 航向锁追着漂移参考跑, 哪个符号都画圈;
+                                  * r8 加自检后病根排除(2026-07-05 boot 实测 -0.65°/2s 合格)。 */
 #define HEADING_LPF_A     0.05f  /* 压线期航向滑动平均系数(20ms拍): τ≈0.4s, 滤掉蛇形摆动的
                                   * 相位, 得到黑线真实走向; 丢线时锁的是这个平均值而非瞬时值 */
 #define LOST_BLIND_MAX    2000   /* 待整定: 盲走最大里程当量, 超限报错(占位) */
@@ -191,6 +192,7 @@ static uint8_t g_lap_count = 0;     /**< 已完成圈数(模式4 四圈连跑用
 static float g_track_kp   = TRACK_KP;    /**< 循迹外环 KP(运行时可调) */
 static float g_track_kd   = TRACK_KD;    /**< 循迹外环 KD(运行时可调) */
 static int   g_base_speed = BASE_SPEED;  /**< 巡迹基速 mm/s(运行时可调) */
+static float g_heading_kp = HEADING_KP;  /**< 盲走航向锁 KP(串口 'H'/'h' ±0.5, 可为负) */
 static uint8_t g_aim_return_run = 0;/**< AIM 结束后回 RUN(F3 中途对靶)还是进 STOP(F2) */
 static int32_t g_run_beep_ms = 0;   /**< RUN 态过点声光剩余时长(ms), 非阻塞关断 */
 
@@ -336,9 +338,14 @@ static int track_blind_turn(void)
     }
 
     /* 航向锁定: 用"基准航向 - 当前航向"的误差算转向量, 让车沿丢线前的方向直走,
-     * 平稳穿过虚线/弧段(而非瞎猜)。wrap180 处理 ±180 跨界。HEADING_KP 待整定。 */
+     * 平稳穿过虚线/弧段(而非瞎猜)。wrap180 处理 ±180 跨界。
+     * 符号判据(2026-07-05): 手转车头向左(俯视逆时针)90° 看 ch12:
+     *   ch12 变大(+90) -> KP 取正; ch12 变小(-90) -> KP 取负。
+     * 推导: turn>0 使右轮目标更高 = 车头向左; 车头已偏左(此时误差项与 ch12 同号变化)
+     *   需要 turn 反号拉回, 由 KP 符号保证负反馈。增益量级: 残余 0.6% 轮速失配
+     *   等效 turn≈1mm/s, KP=2 时稳态航向误差≈0.5°, 2~4 足够, 过大(>8)恐振荡。 */
     float yaw  = imu_get_yaw();
-    int   turn = (int)(HEADING_KP * wrap180(g_yaw_lock - yaw));
+    int   turn = (int)(g_heading_kp * wrap180(g_yaw_lock - yaw));
 
     /* 盲走里程 = |当前右轮计数 - 基准|; 超上限说明虚线/弧段异常(压根没接回线), 报错。 */
     int32_t d = enc_get_count(ENC_RIGHT) - g_blind_ref;
@@ -745,14 +752,20 @@ void app_tune_step(char which, int dir)
         g_base_speed += (dir >= 0) ? 25 : -25;
         if (g_base_speed < 100) g_base_speed = 100;   /* 下限: 太慢测速量化差 */
         if (g_base_speed > 600) g_base_speed = 600;   /* 上限: 未整定前安全帽 */
+    } else if (which == 'h') {
+        /* 盲走航向锁 KP: 唯一允许负值的调参项(符号本身待现场判定), 夹在 ±10 */
+        g_heading_kp += 0.5f * d;
+        if (g_heading_kp >  10.0f) g_heading_kp =  10.0f;
+        if (g_heading_kp < -10.0f) g_heading_kp = -10.0f;
     }
 }
 
-void app_tune_get(float *kp, float *kd, int *base)
+void app_tune_get(float *kp, float *kd, int *base, float *hkp)
 {
     if (kp)   *kp   = g_track_kp;
     if (kd)   *kd   = g_track_kd;
     if (base) *base = g_base_speed;
+    if (hkp)  *hkp  = g_heading_kp;
 }
 
 void app_get_vel_debug(float *tgt_l, float *meas_l, float *tgt_r, float *meas_r)

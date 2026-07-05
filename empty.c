@@ -115,17 +115,21 @@ static void task_key(void)
 /* 串口命令台(F4 "串口设定运行模式与参数"): 复用 UART0(VOFA 那条线)的接收方向,
  * 在 VOFA 的发送框里敲单字符命令即可(结尾的\r\n会被忽略)。
  *   '1'~'4' = 设模式(仅待机) | 's' = 启动(仅待机) | 'x' = 急停(任何时候)
- *   'P'/'p' = 循迹 KP 增/减  | 'D'/'d' = KD 增/减 | 'V'/'v' = 基速增/减 | '?' = 报状态
+ *   'P'/'p' = 循迹 KP 增/减  | 'D'/'d' = KD 增/减 | 'V'/'v' = 基速增/减
+ *   'H'/'h' = 盲走航向锁 KP 增/减(±0.5, 唯一可负项, 符号现场判) | '?' = 报状态
  * UART0 未开 RX 中断: 靠 10ms 轮询 + 硬件 RX FIFO 缓冲, 手敲命令绰绰有余。 */
 static void cmd_print_status(void)
 {
-    float kp, kd; int base;
-    app_tune_get(&kp, &kd, &base);
+    float kp, kd, hkp; int base;
+    app_tune_get(&kp, &kd, &base, &hkp);
     uart_puts("[CMD] st=");   uart_print_u32((uint32_t)app_get_state());
     uart_puts(" md=");        uart_print_u32((uint32_t)app_get_mode());
     uart_puts(" KPx100=");    uart_print_u32((uint32_t)(kp * 100.0f + 0.5f));
     uart_puts(" KDx100=");    uart_print_u32((uint32_t)(kd * 100.0f + 0.5f));
     uart_puts(" V=");         uart_print_u32((uint32_t)base);
+    uart_puts(" HKPx100=");   /* 航向锁 KP 可为负, 手工打符号(uart_print_u32 只认无符号) */
+    if (hkp < 0.0f) { uart_puts("-"); uart_print_u32((uint32_t)(-hkp * 100.0f + 0.5f)); }
+    else            {                 uart_print_u32((uint32_t)( hkp * 100.0f + 0.5f)); }
     uart_puts("\r\n");
 }
 static void task_cmd(void)
@@ -150,6 +154,8 @@ static void task_cmd(void)
         case 'd': app_tune_step('d', -1); cmd_print_status(); break;
         case 'V': app_tune_step('v', +1); cmd_print_status(); break;
         case 'v': app_tune_step('v', -1); cmd_print_status(); break;
+        case 'H': app_tune_step('h', +1); cmd_print_status(); break;
+        case 'h': app_tune_step('h', -1); cmd_print_status(); break;
         case '?': cmd_print_status(); break;
         default:  break;   /* \r \n 及未知字符: 静默忽略 */
         }
@@ -380,7 +386,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r11: enc-R 254.35 (=L/4) + wheel 47mm, fix white-floor left-drift] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r12: heading-lock live-tune 'H'/'h' (sign field-set), blind-walk closes yaw loop] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
