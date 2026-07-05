@@ -224,8 +224,10 @@ static void task_vofa(void)
     imu_get_diag(&imu_ok, &imu_fail, 0);         /* IMU I2C 诊断快照(纯读) */
     float hkp;
     app_tune_get(0, 0, 0, &hkp);                 /* 盲走航向锁 KP 快照(纯读) */
+    float blk, blt, bon;
+    app_get_blind_debug(&blk, &blt, &bon);       /* 盲走锁定/转向量/压线时长快照(纯读) */
 
-    float ch[20] = {
+    float ch[23] = {
         (float)app_get_state(),          /* ch0: 状态机状态(0=IDLE 1=RUN 2=AIM 3=STOP 4=ESTOP) */
         (float)enc_get_count(ENC_LEFT),  /* ch1: 左轮累计计数(手转轮子应变化 -> 验 QEI) */
         (float)enc_get_count(ENC_RIGHT), /* ch2: 右轮累计计数(验 PA27 中断链路) */
@@ -246,8 +248,11 @@ static void task_vofa(void)
         (float)imu_ok,                   /* ch17: IMU 突发读累计成功 —— 健康时每秒+100 */
         (float)imu_fail,                 /* ch18: IMU 突发读累计失败 —— 和 ch17 的比值=丢包率 */
         hkp,                             /* ch19: 盲走航向锁 KP —— 按 H/h 应 ±0.5 跳变, 免在乱码里捞'?'回显 */
+        blk,                             /* ch20: 盲走锁定航向(°) —— 复盘对照 ch12: 差×HKP≈ch21 */
+        blt,                             /* ch21: 盲走转向量(mm/s, 压线=0) —— 非零区间即盲走段 */
+        bon,                             /* ch22: 连续压线时长(ms) —— 齿高<600=弧末闪断缴械证据 */
     };
-    vofa_send(ch, 20);
+    vofa_send(ch, 23);
 }
 
 /* 任务表: { 函数, 周期ms, 计时器(初值=周期), 就绪标志 } —— 周期与交接说明 §4 / app.h 的 APP_*_DT_MS 一致 */
@@ -389,7 +394,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r18: arc-finish on edge-dropout (+30deg completion, direction-adaptive)] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r19: audit fixes - acq debounce / lock reuse / curvature FF / r18-finish removed] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

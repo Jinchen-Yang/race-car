@@ -145,4 +145,10 @@ void app_get_vel_debug(float *tgt_l, float *meas_l, float *tgt_r, float *meas_r)
  */
 void app_get_vel_out(float *out_l, float *out_r);
 
+/**
+ * @brief 读取盲走遥测快照(锁定航向°/盲走转向量/连续压线ms), 给 VOFA ch20/21/22
+ * @note  纯只读。复盘: ch20 vs ch12 之差 × HKP 应≈ch21; ch22 齿高<600 = 闪断缴械证据。
+ */
+void app_get_blind_debug(float *lock, float *turn, float *online);
+
 #endif /* APP_H */

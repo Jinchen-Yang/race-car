@@ -89,14 +89,22 @@ extern volatile uint32_t g_tick_ms;
 #define HEADING_ONLINE_MIN_MS 600 /* r17: 压线不足此时长就丢线, 平均值没收敛不可信 -> 锁定不加外推 */
 #define HEADING_TURN_LIM   100   /* r17: 盲走转向量硬限幅(mm/s)。数学上限 2×180°=360 够原地画圈;
                                   * 夹 100 后坏锁定值最多走 R≈21cm 缓弧(减灾, 非根治) */
-#define BLIND_ARC_FINISH_DEG 30.0f /* r18 弧末"补完转角": 紧弧上 P 外环有稳态横向偏差, 线骑在
-                                  * 传感器边缘, 会在几何末端之前掉线(边缘掉线), 剩下 ~30° 弧
-                                  * 没转完(2026-07-05 实跑观测"末端本应0°仍按30°走")。判据=
-                                  * 掉线瞬间最后一帧灰度偏差在边缘(|err|>GRAY_EDGE_TH) 且确在
-                                  * 转弯(|fast-slow|>3°): 认定提前掉线, 按原转向继续补转此角。
-                                  * 干净末端(整排探头同时变白, |err|小)不补, 纯锁切线。
-                                  * 方向自适应(取 fast-slow 符号), 反向跑圈自动翻号。 */
-#define GRAY_EDGE_TH      200    /* 待整定: "线在传感器边缘"的偏差门限(加权质心量纲) */
+/* (r18 的"边缘掉线补转±30°"已于 r19 移除 —— 对抗审计定案: 单帧 gray_last_error 判据
+ *  零区分度(边缘逃逸掉线最后一帧必为±350, 真末端也约半数>门限), 固定30°还过补,
+ *  是"大量右转圈"的直接推手。根治改为 TRACK_FF_GAIN 曲率前馈, 见下。) */
+#define TRACK_ACQ_N        3     /* r19 盲走解锁去抖: 连续在线帧数达此值才算"确认重新压线"。
+                                  * 审计定案("30°之谜"): 弧末线骑传感器边缘, 1~2 帧闪断频发;
+                                  * 旧逻辑单帧即解锁+再丢线重锁, 把首锁(带外推的好值)秒换成
+                                  * 冻结的 fast 裸值, 且 online 计时永远到不了 600ms —— 外推
+                                  * 在唯一需要它的地方被自我缴械。闪断期间沿用原锁定继续走。 */
+#define TRACK_FF_GAIN      4.6f  /* r19 弧上曲率前馈: turn_ff = 增益×(fast-slow)。
+                                  * 推导: ω̂(°/s)=(fast-slow)/(τs-τf)=d/0.267s;
+                                  * turn_ff(mm/s)=ω̂·(π/180)·(轮距/2≈70mm) ≈ 4.58×d。
+                                  * 作用: P 外环维持弧上 43°/s 需稳态偏差≈131 -> 线骑传感器
+                                  * 边缘(闪断/提前掉线的总根源); 前馈接管稳态转向后 err_ss→0,
+                                  * 线回传感器中央, 能跟到几何末端。直线段 d≈0 自动归零。
+                                  * ⚠轮距 140mm 为估值, 实测后回填(增益∝轮距)。 */
+#define TRACK_FF_LIM      80.0f  /* 前馈限幅(mm/s): 防快慢平均差噪声放大 */
 #define LOST_BLIND_MAX    2000   /* 待整定: 盲走最大里程当量, 超限报错(占位) */
 
 /* --- 瞄准 --- */
@@ -194,11 +202,14 @@ static uint32_t g_lost_dist  = 0;   /**< 丢线盲走累计里程当量(超 LOST
 static float g_meas_filt[2] = {0.0f, 0.0f};   /**< [ENC_LEFT/RIGHT] 测速低通状态,抑抖 */
 /* --- 丢线盲走(IMU 航向锁定)状态 --- */
 static float   g_yaw_lock     = 0.0f;   /**< 丢线时锁定的航向基准(度, 取压线期滑动平均+滞后外推) */
+static float   g_blind_turn_dbg = 0.0f; /**< 最近一拍盲走转向量(VOFA ch21 用; 压线时清 0) */
 static float   g_yaw_line_avg = 0.0f;   /**< 压线期航向滑动平均-慢(τ≈0.4s, 滤蛇形) */
 static float   g_yaw_line_avg_f = 0.0f; /**< 压线期航向滑动平均-快(τ≈0.13s, 与慢配对外推消弧线滞后) */
 static int32_t g_blind_ref    = 0;      /**< 丢线瞬间的里程基准(右轮计数) */
 static uint8_t g_blind_active = 0;      /**< 盲走中标志(抓丢线上升沿,基准只锁一次; ⚠START必须清=r17教训) */
 static uint16_t g_online_ms   = 0;      /**< 本次连续压线时长(ms): 不足门槛丢线时, 平均值不可信 */
+static uint8_t g_acq_cnt      = 0;      /**< r19: 盲走中连续在线帧计数(解锁去抖, 闪断不算重新压线) */
+static uint8_t g_lock_valid   = 0;      /**< r19: 已有一次正式锁定(短压线再丢线时沿用旧锁, 防污染重锁) */
 /* --- 状态机入态检测 + STOP 声光一次性 --- */
 static app_state_e g_prev_state = APP_ST_IDLE;   /**< 上一拍状态(检测"刚入态") */
 static int32_t g_stop_beep_ms   = 0;             /**< STOP 到点蜂鸣剩余时长(ms),非阻塞关断 */
@@ -353,23 +364,21 @@ static int track_blind_turn(void)
      * 带着几度偏角, 锁瞬时值会沿偏角走斜线(2026-07-05 实测坐实); 平均值滤掉摆动相位,
      * 剩下的就是黑线的真实走向, 按它直走才能命中对面胶带首端。 */
     if (!g_blind_active) {
-        /* 锁"线的方向", 不是"车头此刻的方向"; 且用快/慢双平均外推消弧线滞后:
-         * 恒速转弯时 fast-slow 正比转速, 外推 0.5(fast-slow) 恰好补回滞后角;
-         * 直线出线时 fast≈slow, 外推≈0, 回退为纯平均。夹 ±25° 防噪声放大。
-         * r17: 刚才压线不足 0.6s(贴线挣扎/闪断)则平均未收敛, 不加外推只用快平均。
-         * r18: 弧末"边缘掉线"(还在转弯且最后一帧线在传感器边缘)= 弧没走完就丢线,
-         *      按原转向补转 BLIND_ARC_FINISH_DEG; 干净末端(整排变白,|err|小)不补。 */
-        float extrap = 0.0f, finish = 0.0f;
-        if (g_online_ms >= HEADING_ONLINE_MIN_MS) {
-            float d = g_yaw_line_avg_f - g_yaw_line_avg;   /* 正比当前转速, 带转向符号 */
-            extrap = clampf(0.5f * d, -HEADING_EXTRAP_LIM, HEADING_EXTRAP_LIM);
-            int last_err = (int)gray_last_error();
-            if ((d > 3.0f || d < -3.0f) &&
-                (last_err > GRAY_EDGE_TH || last_err < -GRAY_EDGE_TH)) {
-                finish = (d < 0.0f) ? -BLIND_ARC_FINISH_DEG : BLIND_ARC_FINISH_DEG;
-            }
+        if (g_online_ms < HEADING_ONLINE_MIN_MS && g_lock_valid) {
+            /* r19: 短暂压线(<0.6s)后又丢线 = 大概率"横穿对面胶带没接上"——压线期
+             * 车头乱摆, 平均值是垃圾。沿用上一次锁定值按原方向继续直走, 把"一次
+             * 没接上"降级为"在弧更远处再相遇"。(审计定案: "失败横穿→污染重锁→
+             * 更斜入射→再失败"这个循环就是'转圈'的闭合机制, 在此拆环。)
+             * 顺带福利: 真赛道虚线段的每个空档都会沿用第一次的锁定, 全程一根直线。 */
+        } else {
+            /* 充分压线后的正式出线: 锁"线的方向"(快/慢双平均+滞后外推), 不是
+             * "车头此刻的方向"。恒速转弯时外推 0.5(fast-slow) 精确消滞后;
+             * 直线出线时 fast≈slow 自动退化为纯平均。夹 ±25° 防噪声放大。 */
+            float extrap = 0.5f * (g_yaw_line_avg_f - g_yaw_line_avg);
+            extrap = clampf(extrap, -HEADING_EXTRAP_LIM, HEADING_EXTRAP_LIM);
+            g_yaw_lock   = g_yaw_line_avg_f + extrap;
+            g_lock_valid = 1;
         }
-        g_yaw_lock    = g_yaw_line_avg_f + extrap + finish;
         g_blind_ref   = enc_get_count(ENC_RIGHT);  /* 里程基准: 右轮 int32 累加值,不回绕 */
         g_blind_active = 1;
         g_online_ms   = 0;                         /* 下段压线重新计时 */
@@ -384,9 +393,10 @@ static int track_blind_turn(void)
      *   等效 turn≈1mm/s, KP=2 时稳态航向误差≈0.5°, 2~4 足够, 过大(>8)恐振荡。 */
     float yaw  = imu_get_yaw();
     int   turn = (int)(g_heading_kp * wrap180(g_yaw_lock - yaw));
-    /* r17 硬限幅: 转圈事故保险 —— 就算锁定值是垃圾, 盲走最多走缓弧, 不可能原地画圈 */
+    /* r17 硬限幅: 减灾 —— 坏锁定值最多走 R≈21cm 缓弧 */
     if (turn >  HEADING_TURN_LIM) turn =  HEADING_TURN_LIM;
     if (turn < -HEADING_TURN_LIM) turn = -HEADING_TURN_LIM;
+    g_blind_turn_dbg = (float)turn;   /* 遥测: VOFA ch21 */
 
     /* 盲走里程 = |当前右轮计数 - 基准|; 超上限说明虚线/弧段异常(压根没接回线), 报错。 */
     int32_t d = enc_get_count(ENC_RIGHT) - g_blind_ref;
@@ -408,23 +418,43 @@ void track_loop_step(void)
     int err  = (int)gray_get_error();
     int lost = (int)gray_is_lost();
 
-    int turn;
+    /* r19 盲走解锁去抖: 盲走中出现的在线帧要连续 TRACK_ACQ_N 帧才算"确认重新压线";
+     * 1~2 帧闪断(弧末线骑传感器边缘的常态)不解锁、不喂平均、继续按原锁定走。 */
     if (!lost) {
-        /* 压线: 外环位置式 PID, 目标偏差=0, 实测=err, 出转向量。 */
-        g_lost_dist = 0;        /* 重新压到线: 清盲走里程 */
-        g_blind_active = 0;     /* 解除航向锁, 下次丢线重新锁基准 */
+        if (g_blind_active) {
+            g_acq_cnt++;
+            if (g_acq_cnt >= TRACK_ACQ_N) {
+                g_blind_active = 0;
+                g_acq_cnt = 0;
+                /* re-base: 上一段线的方向数据对新一段是污染源(可能差 30~180°),
+                 * 两个平均从当前航向重新起步, 压线计时也重启。 */
+                g_yaw_line_avg = g_yaw_line_avg_f = imu_get_yaw();
+                g_online_ms = 0;
+            }
+        }
+    } else {
+        g_acq_cnt = 0;
+    }
+
+    int turn;
+    if (!lost && !g_blind_active) {
+        /* 确认压线: 外环位置式 PID + 弧上曲率前馈(见 TRACK_FF_GAIN 推导)。 */
+        g_lost_dist = 0;        /* 清盲走里程 */
+        g_blind_turn_dbg = 0.0f;/* 遥测: 压线期 ch21 归零, 波形上一眼看出盲走区间 */
         if (g_online_ms < 10000u) {
             g_online_ms = (uint16_t)(g_online_ms + APP_TRACK_DT_MS);  /* 连续压线计时(1万ms封顶) */
         }
         /* 持续更新"线的走向"估计: 快/慢两个航向滑动平均(盲走锁其外推组合, 见 track_blind_turn) */
-        {
-            float y = imu_get_yaw();
-            g_yaw_line_avg   += HEADING_LPF_A      * (y - g_yaw_line_avg);
-            g_yaw_line_avg_f += HEADING_LPF_A_FAST * (y - g_yaw_line_avg_f);
-        }
-        turn = (int)pid_update(&g_pid_track, 0.0f, (float)err);
+        float y = imu_get_yaw();
+        g_yaw_line_avg   += HEADING_LPF_A      * (y - g_yaw_line_avg);
+        g_yaw_line_avg_f += HEADING_LPF_A_FAST * (y - g_yaw_line_avg_f);
+        /* 曲率前馈: 快慢平均差正比当前转速, 接管弧上稳态转向, 让 PID 只管瞬态,
+         * 稳态偏差→0, 线回传感器中央(弧末闪断/提前掉线的根治)。直线段自动归零。 */
+        float ff = clampf(TRACK_FF_GAIN * (g_yaw_line_avg_f - g_yaw_line_avg),
+                          -TRACK_FF_LIM, TRACK_FF_LIM);
+        turn = (int)(pid_update(&g_pid_track, 0.0f, (float)err) + ff);
     } else {
-        /* 丢线(虚线/弧段): 切 IMU 航向锁定盲走(占位)。 */
+        /* 丢线 或 在线未过去抖(闪断嫌疑期): IMU 航向锁定盲走。 */
         turn = track_blind_turn();
     }
 
@@ -607,6 +637,13 @@ void app_fsm_step(void)
             g_blind_active = 0;   /* ★r17: 上轮跑到一半丢线急停时此标志滞留=1, 不清则新一轮
                                    * 第一拍盲走沿用上轮陈旧锁定航向 -> 启动即猛转(真机转圈实锤) */
             g_online_ms = 0;
+            g_acq_cnt = 0;
+            g_lock_valid = 0;     /* r19: 新一轮的第一次锁定必须重算, 不许沿用上轮的锁 */
+            /* r19 卫生项(审计): 消费搬车期间滞留的编码器增量 + 清测速滤波,
+             * 防起步首拍速度环吃到 ±1500 假速度脉冲(非 RUN 态无人读 delta, 会攒一大坨) */
+            (void)enc_get_delta(ENC_LEFT);
+            (void)enc_get_delta(ENC_RIGHT);
+            g_meas_filt[0] = g_meas_filt[1] = 0.0f;
             g_kp_idx = 0;
             g_lap_count = 0;
             g_run_beep_ms = 0;
@@ -845,6 +882,16 @@ void app_get_vel_out(float *out_l, float *out_r)
     if (out_r) *out_r = g_vel_out_r;
 }
 
+void app_get_blind_debug(float *lock, float *turn, float *online)
+{
+    /* 只读快照: 盲走锁定航向 + 最近盲走转向量(压线时 turn=0) + 连续压线时长(ms),
+     * 给 VOFA ch20/21/22。复盘判读: ch20(锁定) vs ch12(实际航向) 的差 × HKP 应≈ch21;
+     * ch22 锯齿的齿高<600 即"闪断缴械"证据。三线对照当场区分病灶。 */
+    if (lock)   *lock   = g_yaw_lock;
+    if (turn)   *turn   = g_blind_turn_dbg;
+    if (online) *online = (float)g_online_ms;
+}
+
 /* ============================================================================
  *  初始化
  * ==========================================================================*/
@@ -872,6 +919,8 @@ void app_init(void)
     g_meas_filt[0] = g_meas_filt[1] = 0.0f;
     g_blind_active = 0;
     g_online_ms = 0;
+    g_acq_cnt = 0;
+    g_lock_valid = 0;
     g_stop_beep_ms = 0;
     g_prev_state = APP_ST_IDLE;
     g_state = APP_ST_IDLE;
