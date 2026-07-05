@@ -105,6 +105,32 @@ extern volatile uint32_t g_tick_ms;
                                   * 线回传感器中央, 能跟到几何末端。直线段 d≈0 自动归零。
                                   * ⚠轮距 140mm 为估值, 实测后回填(增益∝轮距)。 */
 #define TRACK_FF_LIM      80.0f  /* 前馈限幅(mm/s): 防快慢平均差噪声放大 */
+
+/* ===== r20 驱动架构切换: 编码器出局, 开环占空 + 陀螺/灰度差速 =====
+ * 台架实锤(2026-07-05): 左编码器间歇无信号(测速读零→保险丝正确ESTOP), 右编码器
+ * ±20% 电气毛刺(悬空空转即有) —— 速度闭环骑在两个说谎的传感器上, 是"走不直/
+ * 时左时右/循迹艰难"全部怪相的第一因。本题不需要轮速环(2024H 开源方案佐证:
+ * 直线=航向锁差速, 弧线=灰度差速, 定占空开环足够)。编码器仅保留测速遥测
+ * (I5/I7, 持续观察病情)与右轮里程参考, 不再参与控制。
+ * 修好编码器后可把 DRIVE_OPEN_LOOP 置 0 回到速度闭环, 两套路径都保留。 */
+#define DRIVE_OPEN_LOOP   1
+#define DUTY_PER_MMS      0.5f   /* mm/s->占空 换算(开环标定 G≈2.0mm/s每占空 的倒数)。
+                                  * 出口换算的好处: 原 mm/s 量纲的全部增益/限幅/在线调参
+                                  * ('V'基速/'H'航向KP/循迹KP·KD)语义不变, 免全案重整定。
+                                  * ⚠电池电压跌落会让此系数变小(占空同样速度更低), 换算是
+                                  * 近似; 差速转向只依赖左右对称性, 影响可容忍。 */
+
+/* --- r20 捕线强转(借鉴参考方案"进弧强制转向", 改造成非阻塞) --- */
+#define CAPTURE_ERR_TH    250    /* 确认压线时|err|超此值=斜插进线, 先原地对正再交 PID */
+#define CAPTURE_DONE_TH   100    /* 原地转到|err|小于此值, 交还循迹 PID */
+#define CAPTURE_PIVOT_DUTY 120   /* 原地转向占空(左右反向) 待整定 */
+#define CAPTURE_PIVOT_MAX_MS 700 /* 强转超时保险: 超时放弃, 回正常流程 */
+
+/* --- r20 事件节点(取代 KP_GATES 里程/航向门限; 参考方案 beep_flag_num 思路) ---
+ * 本场地一圈恰好 4 个"压线/离线"事件: B(压上弧)→C(离弧)→D(压上弧)→A(离弧,停)。
+ * 压线节点 = 连续压线达 NODE_HIT_MIN_MS(短于此的擦线/捕获失败不算节点);
+ * 离线节点 = 充分压线(≥HEADING_ONLINE_MIN_MS)后的正式出线锁定(START 首锁不算)。 */
+#define NODE_HIT_MIN_MS   400
 #define LOST_BLIND_MAX    2000   /* 待整定: 盲走最大里程当量, 超限报错(占位) */
 
 /* --- 瞄准 --- */
@@ -159,6 +185,7 @@ extern volatile uint32_t g_tick_ms;
  * 场地 = 2024H 同款(题目 Figure1 标注): A→B 直线, B→C 半弧(累计+180°), C→D 直线, D→A 半弧(+360°)。
  * 航向用 |净转角|(顺/逆时针通吃), 里程用右轮累计。理论: 直线≈1400mm, 半弧≈π*400≈1257mm。
  * 门限取"理论值 × ~0.8"留裕量, 靠顺序推进防误触; 真场地量了尺寸后回填。 */
+#if !DRIVE_OPEN_LOOP   /* r20: 事件节点(压线/离线)取代里程门限, 本表仅速度闭环模式保留 */
 typedef struct {
     float yaw_min_deg;    /**< 累计|航向|门限(°); 0 = 不设航向条件(纯里程) */
     float dist_min_mm;    /**< 累计里程门限(mm) */
@@ -210,6 +237,10 @@ static uint8_t g_blind_active = 0;      /**< 盲走中标志(抓丢线上升沿,
 static uint16_t g_online_ms   = 0;      /**< 本次连续压线时长(ms): 不足门槛丢线时, 平均值不可信 */
 static uint8_t g_acq_cnt      = 0;      /**< r19: 盲走中连续在线帧计数(解锁去抖, 闪断不算重新压线) */
 static uint8_t g_lock_valid   = 0;      /**< r19: 已有一次正式锁定(短压线再丢线时沿用旧锁, 防污染重锁) */
+static uint16_t g_pivot_ms    = 0;      /**< r20: 捕线强转剩余时限 ms(0=不在强转) */
+static int8_t  g_pivot_dir    = 0;      /**< r20: 强转方向 +1=线在右侧顺时针原地转 / -1=反 */
+static uint8_t g_node_pending = 0;      /**< r20: 待 FSM 消费的节点事件数(track 写, FSM 读, 同主循环无竞态) */
+static uint8_t g_node_hit_fired = 0;    /**< r20: 本次压线的"压线节点"已发过(one-shot) */
 /* --- 状态机入态检测 + STOP 声光一次性 --- */
 static app_state_e g_prev_state = APP_ST_IDLE;   /**< 上一拍状态(检测"刚入态") */
 static int32_t g_stop_beep_ms   = 0;             /**< STOP 到点蜂鸣剩余时长(ms),非阻塞关断 */
@@ -332,7 +363,13 @@ void vel_loop_step(void)
     if (g_state != APP_ST_RUN) {
         return;
     }
-#if VEL_OPEN_LOOP_TEST
+#if DRIVE_OPEN_LOOP
+    /* r20: 编码器只测不控 —— I5/I7 遥测保留(持续观察两个带病编码器的病情),
+     * 电机由 track_loop_step 直接以占空驱动; 速度闭环与"瞎油门保险丝"停用
+     * (保险丝以编码器为证词, 编码器说谎时它反而会误杀, 台架已发生过)。 */
+    (void)vel_measure(ENC_LEFT);
+    (void)vel_measure(ENC_RIGHT);
+#elif VEL_OPEN_LOOP_TEST
     /* ★开环诊断: 恒占空直驱 + 照常测速(只测不控)。VOFA 上 I5/I7 显示的是真实测速,
      * I4/I6 目标值此模式下无意义。诊断完把 VEL_OPEN_LOOP_TEST 改回 0! */
     (void)vel_measure(ENC_LEFT);
@@ -378,6 +415,9 @@ static int track_blind_turn(void)
             extrap = clampf(extrap, -HEADING_EXTRAP_LIM, HEADING_EXTRAP_LIM);
             g_yaw_lock   = g_yaw_line_avg_f + extrap;
             g_lock_valid = 1;
+            if (g_online_ms >= HEADING_ONLINE_MIN_MS) {
+                g_node_pending++;   /* r20 离线节点: 正式出线才算(C/A 点); START 首锁不算 */
+            }
         }
         g_blind_ref   = enc_get_count(ENC_RIGHT);  /* 里程基准: 右轮 int32 累加值,不回绕 */
         g_blind_active = 1;
@@ -430,19 +470,47 @@ void track_loop_step(void)
                  * 两个平均从当前航向重新起步, 压线计时也重启。 */
                 g_yaw_line_avg = g_yaw_line_avg_f = imu_get_yaw();
                 g_online_ms = 0;
+                g_node_hit_fired = 0;
+                /* r20 捕线强转: 斜插进线(|err| 在边缘)时先原地对正再交 PID,
+                 * 防"横穿而不捕获"(参考方案的进弧强制转向, 非阻塞版)。 */
+                if (err > CAPTURE_ERR_TH || err < -CAPTURE_ERR_TH) {
+                    g_pivot_ms  = CAPTURE_PIVOT_MAX_MS;
+                    g_pivot_dir = (err > 0) ? (int8_t)1 : (int8_t)-1;
+                }
             }
         }
     } else {
         g_acq_cnt = 0;
+        g_pivot_ms = 0;    /* 强转途中转丢线: 放弃强转, 交回盲走 */
     }
 
     int turn;
     if (!lost && !g_blind_active) {
+        /* --- r20 捕线强转小状态: 原地转向把线转到传感器中央, 再交 PID --- */
+        if (g_pivot_ms > 0) {
+            g_pivot_ms = (g_pivot_ms > APP_TRACK_DT_MS)
+                       ? (uint16_t)(g_pivot_ms - APP_TRACK_DT_MS) : 0u;
+            if (err > -CAPTURE_DONE_TH && err < CAPTURE_DONE_TH) {
+                g_pivot_ms = 0;                    /* 已对正, 交还 PID */
+            } else {
+#if DRIVE_OPEN_LOOP
+                /* 原地转: err>0(线在右) -> 左轮进右轮退 = 顺时针 */
+                motor_set(MOTOR_LEFT,  WHEEL_SIGN_L * (int)g_pivot_dir * CAPTURE_PIVOT_DUTY);
+                motor_set(MOTOR_RIGHT, -(WHEEL_SIGN_R * (int)g_pivot_dir * CAPTURE_PIVOT_DUTY));
+#endif
+                return;   /* 强转期间: 不喂平均/不计时/不跑 PID */
+            }
+        }
         /* 确认压线: 外环位置式 PID + 弧上曲率前馈(见 TRACK_FF_GAIN 推导)。 */
         g_lost_dist = 0;        /* 清盲走里程 */
         g_blind_turn_dbg = 0.0f;/* 遥测: 压线期 ch21 归零, 波形上一眼看出盲走区间 */
         if (g_online_ms < 10000u) {
             g_online_ms = (uint16_t)(g_online_ms + APP_TRACK_DT_MS);  /* 连续压线计时(1万ms封顶) */
+        }
+        /* r20 压线节点: 连续压线达门限发一次事件(B/D 点), FSM 负责声光/路由 */
+        if (!g_node_hit_fired && g_online_ms >= NODE_HIT_MIN_MS) {
+            g_node_hit_fired = 1;
+            g_node_pending++;
         }
         /* 持续更新"线的走向"估计: 快/慢两个航向滑动平均(盲走锁其外推组合, 见 track_blind_turn) */
         float y = imu_get_yaw();
@@ -458,10 +526,26 @@ void track_loop_step(void)
         turn = track_blind_turn();
     }
 
+#if DRIVE_OPEN_LOOP
+    /* r20 直驱输出级: 基速±转向量(mm/s 量纲, 全部原有增益沿用) -> 占空 -> 电机。
+     * 编码器不再参与; 直线靠航向锁闭环、弧线靠灰度闭环, 左右电机差异由这两个
+     * "看得见车实际怎么走"的外环自然吸收(这正是速度环用说谎编码器时做不到的)。 */
+    {
+        int dl = WHEEL_SIGN_L * (int)((float)(g_base_speed - turn) * DUTY_PER_MMS);
+        int dr = WHEEL_SIGN_R * (int)((float)(g_base_speed + turn) * DUTY_PER_MMS);
+        g_vel_tgt_l = (float)(g_base_speed - turn);   /* 遥测沿用 ch4/ch6 */
+        g_vel_tgt_r = (float)(g_base_speed + turn);
+        g_vel_out_l = (float)dl;                      /* 遥测沿用 ch8/ch9 */
+        g_vel_out_r = (float)dr;
+        motor_set(MOTOR_LEFT,  dl);
+        motor_set(MOTOR_RIGHT, dr);
+    }
+#else
     /* 串级: 基速 ± 转向量 -> 左右目标速度(带安装符号补偿); 写给内环执行。
      * ⚠ WHEEL_SIGN_L/R 现场标定(镜像安装可能其一取反)。基速用运行时副本(串口可调)。 */
     g_vel_tgt_l = (float)(WHEEL_SIGN_L * (g_base_speed - turn));
     g_vel_tgt_r = (float)(WHEEL_SIGN_R * (g_base_speed + turn));
+#endif
 }
 
 /* ============================================================================
@@ -602,6 +686,7 @@ static int keypoint_event(void)
     }
     return 0;
 }
+#endif /* !DRIVE_OPEN_LOOP */
 
 /* ============================================================================
  *  状态机
@@ -639,6 +724,9 @@ void app_fsm_step(void)
             g_online_ms = 0;
             g_acq_cnt = 0;
             g_lock_valid = 0;     /* r19: 新一轮的第一次锁定必须重算, 不许沿用上轮的锁 */
+            g_pivot_ms = 0;
+            g_node_pending = 0;
+            g_node_hit_fired = 0;
             /* r19 卫生项(审计): 消费搬车期间滞留的编码器增量 + 清测速滤波,
              * 防起步首拍速度环吃到 ±1500 假速度脉冲(非 RUN 态无人读 delta, 会攒一大坨) */
             (void)enc_get_delta(ENC_LEFT);
@@ -675,31 +763,26 @@ void app_fsm_step(void)
             }
         }
         {
-            int kp = keypoint_event();
-            if (kp == 4) {
-                if (g_run_mode == 4u && (g_lap_count + 1u) < APP_LAPS_MODE4) {
-                    /* 发挥3 四圈连跑: 过 A 计圈+声光, 重置基准继续跑 */
-                    g_lap_count++;
-                    beep_on();
-                    g_run_beep_ms = KEYPOINT_BEEP_MS;
-                    g_lap_yaw0 = imu_get_yaw();
-                    g_lap_odo0 = enc_get_count(ENC_RIGHT);
-                    g_kp_idx = 0;
-                } else {
-                    /* 回到 A: 完赛停车(F1/F3/第4圈共用; STOP 入态自带声光) */
-                    g_state = APP_ST_STOP;
+            /* r20 事件节点路由(取代里程/航向门限): 一圈 4 节点 = B压线→C离线→D压线→A离线。
+             * 节点由 track 环产生(压线≥400ms / 正式出线), 天然对准真实场地, 免标定。 */
+            while (g_node_pending > 0u) {
+                g_node_pending--;
+                g_kp_idx++;
+                beep_on();                       /* 每个节点声光提示(题目要求) */
+                g_run_beep_ms = KEYPOINT_BEEP_MS;
+                if (g_run_mode == 3u && g_kp_idx == 1u) {
+                    /* F3 到 B(第1节点): 停车对靶, 结束后回 RUN 续跑 */
+                    g_aim_timer = 0;
+                    g_aim_return_run = 1;
+                    g_state = APP_ST_AIM;
+                } else if (g_kp_idx >= 4u) {
+                    if (g_run_mode == 4u && (g_lap_count + 1u) < APP_LAPS_MODE4) {
+                        g_lap_count++;           /* 发挥3: 过 A 计圈, 继续跑下一圈 */
+                        g_kp_idx = 0;
+                    } else {
+                        g_state = APP_ST_STOP;   /* 回 A: 完赛停车(F1/F3/第4圈共用) */
+                    }
                 }
-            } else if (kp == 1 && g_run_mode == 3u) {
-                /* F3 到 B: 声光 + 停车对靶作业, 结束后回 RUN 续跑 */
-                beep_on();
-                g_run_beep_ms = KEYPOINT_BEEP_MS;
-                g_aim_timer = 0;
-                g_aim_return_run = 1;
-                g_state = APP_ST_AIM;
-            } else if (kp > 0) {
-                /* C/D: 过点声光, 不停车(题目: 每经过关键点须声光提示) */
-                beep_on();
-                g_run_beep_ms = KEYPOINT_BEEP_MS;
             }
         }
         break;
@@ -921,6 +1004,9 @@ void app_init(void)
     g_online_ms = 0;
     g_acq_cnt = 0;
     g_lock_valid = 0;
+    g_pivot_ms = 0;
+    g_node_pending = 0;
+    g_node_hit_fired = 0;
     g_stop_beep_ms = 0;
     g_prev_state = APP_ST_IDLE;
     g_state = APP_ST_IDLE;
