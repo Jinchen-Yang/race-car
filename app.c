@@ -61,7 +61,7 @@ extern volatile uint32_t g_tick_ms;
 #define VEL_MEAS_LPF      0.5f   /* 待整定: 测速一阶低通系数(0~1,越小越平滑),抑制编码器抖动(等效参考工程的多点滑窗) */
 
 /* --- 循迹外环(位置式 PID) --- */
-#define TRACK_KP          1.0f   /* 待整定: 外环比例(偏差->转向量)(占位) */
+#define TRACK_KP          0.5f   /* 整定中: 1.0 蛇形且弯道甩丢线(2026-07-05 首跑), 第一轮减半 */
 #define TRACK_KD          0.0f   /* 待整定: 外环微分(抑制摆动)(占位) */
 #define TRACK_OUT_LIM   (400.0f) /* 待整定: 转向量限幅(占位) */
 #define BASE_SPEED        300    /* 待整定: 巡迹基速, 单位 mm/s(=0.3m/s, 起步偏保守; 换算已定标, 单位从"当量"变真实物理量) */
