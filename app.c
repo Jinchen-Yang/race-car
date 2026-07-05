@@ -88,7 +88,15 @@ extern volatile uint32_t g_tick_ms;
 #define HEADING_EXTRAP_LIM 25.0f /* 外推项保险夹(°): 防快平均噪声被 1.5/-0.5 组合放大 */
 #define HEADING_ONLINE_MIN_MS 600 /* r17: 压线不足此时长就丢线, 平均值没收敛不可信 -> 锁定不加外推 */
 #define HEADING_TURN_LIM   100   /* r17: 盲走转向量硬限幅(mm/s)。数学上限 2×180°=360 够原地画圈;
-                                  * 夹 100 后坏锁定值最多走缓弧, 物理上疯不了(真机转圈事故后加) */
+                                  * 夹 100 后坏锁定值最多走 R≈21cm 缓弧(减灾, 非根治) */
+#define BLIND_ARC_FINISH_DEG 30.0f /* r18 弧末"补完转角": 紧弧上 P 外环有稳态横向偏差, 线骑在
+                                  * 传感器边缘, 会在几何末端之前掉线(边缘掉线), 剩下 ~30° 弧
+                                  * 没转完(2026-07-05 实跑观测"末端本应0°仍按30°走")。判据=
+                                  * 掉线瞬间最后一帧灰度偏差在边缘(|err|>GRAY_EDGE_TH) 且确在
+                                  * 转弯(|fast-slow|>3°): 认定提前掉线, 按原转向继续补转此角。
+                                  * 干净末端(整排探头同时变白, |err|小)不补, 纯锁切线。
+                                  * 方向自适应(取 fast-slow 符号), 反向跑圈自动翻号。 */
+#define GRAY_EDGE_TH      200    /* 待整定: "线在传感器边缘"的偏差门限(加权质心量纲) */
 #define LOST_BLIND_MAX    2000   /* 待整定: 盲走最大里程当量, 超限报错(占位) */
 
 /* --- 瞄准 --- */
@@ -348,13 +356,20 @@ static int track_blind_turn(void)
         /* 锁"线的方向", 不是"车头此刻的方向"; 且用快/慢双平均外推消弧线滞后:
          * 恒速转弯时 fast-slow 正比转速, 外推 0.5(fast-slow) 恰好补回滞后角;
          * 直线出线时 fast≈slow, 外推≈0, 回退为纯平均。夹 ±25° 防噪声放大。
-         * r17: 刚才压线不足 0.6s(贴线挣扎/闪断)则平均未收敛, 不加外推只用快平均。 */
-        float extrap = 0.0f;
+         * r17: 刚才压线不足 0.6s(贴线挣扎/闪断)则平均未收敛, 不加外推只用快平均。
+         * r18: 弧末"边缘掉线"(还在转弯且最后一帧线在传感器边缘)= 弧没走完就丢线,
+         *      按原转向补转 BLIND_ARC_FINISH_DEG; 干净末端(整排变白,|err|小)不补。 */
+        float extrap = 0.0f, finish = 0.0f;
         if (g_online_ms >= HEADING_ONLINE_MIN_MS) {
-            extrap = 0.5f * (g_yaw_line_avg_f - g_yaw_line_avg);
-            extrap = clampf(extrap, -HEADING_EXTRAP_LIM, HEADING_EXTRAP_LIM);
+            float d = g_yaw_line_avg_f - g_yaw_line_avg;   /* 正比当前转速, 带转向符号 */
+            extrap = clampf(0.5f * d, -HEADING_EXTRAP_LIM, HEADING_EXTRAP_LIM);
+            int last_err = (int)gray_last_error();
+            if ((d > 3.0f || d < -3.0f) &&
+                (last_err > GRAY_EDGE_TH || last_err < -GRAY_EDGE_TH)) {
+                finish = (d < 0.0f) ? -BLIND_ARC_FINISH_DEG : BLIND_ARC_FINISH_DEG;
+            }
         }
-        g_yaw_lock    = g_yaw_line_avg_f + extrap;
+        g_yaw_lock    = g_yaw_line_avg_f + extrap + finish;
         g_blind_ref   = enc_get_count(ENC_RIGHT);  /* 里程基准: 右轮 int32 累加值,不回绕 */
         g_blind_active = 1;
         g_online_ms   = 0;                         /* 下段压线重新计时 */
