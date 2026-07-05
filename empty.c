@@ -283,15 +283,48 @@ int main(void)
         led_run_set(1);
         led_err_set(1);
         uart_puts("IMU gyro calibrating, keep car still...\r\n");
-        if (imu_gyro_calibrate() != 0) {
-            uint32_t cal_good;
-            imu_get_diag(0, 0, &cal_good);
-            uart_puts("[ERR] IMU calibrate failed, good samples = ");
-            uart_print_u32(cal_good);
-            uart_puts("/500\r\n");    /* 0/500=突发读系统性全灭; 300+/500=边缘丢包 */
+        /* 校准 + 2 秒漂移自检, 不合格自动重校(最多 3 轮)。
+         * 背景(2026-07-05): 航向锁正负符号都打转, 头号嫌疑=某些开机校准未生效导致 yaw
+         * 匀速漂移, 航向环追着漂移参考跑必发散。此自检让每次开机自带体检报告:
+         * [DIAG] yaw drift 行 <100(即 <1°/2s)才放行。典型 boot 增时 ~2s, 最坏 ~9s。 */
+        int cal_ok = 0;
+        for (int attempt = 1; attempt <= 3 && !cal_ok; attempt++) {
+            if (imu_gyro_calibrate() != 0) {
+                uint32_t cal_good;
+                imu_get_diag(0, 0, &cal_good);
+                uart_puts("[DIAG] cal attempt fail, good=");
+                uart_print_u32(cal_good);
+                uart_puts("/500, retry...\r\n");
+                continue;
+            }
+            /* 2 秒静止漂移测量: 手动以 10ms 节拍推进积分(调度器此时还没开跑) */
+            {
+                float y0 = imu_get_yaw();
+                uint32_t t0 = g_tick_ms, t_upd = t0;
+                while ((g_tick_ms - t0) < 2000u) {
+                    if ((g_tick_ms - t_upd) >= 10u) {
+                        t_upd = g_tick_ms;
+                        imu_update();
+                    }
+                }
+                float dy = imu_get_yaw() - y0;              /* 2 秒净漂移(°) */
+                float ady = (dy < 0.0f) ? -dy : dy;
+                uart_puts("[DIAG] yaw drift x100: ");
+                if (dy < 0.0f) uart_puts("-");
+                uart_print_u32((uint32_t)(ady * 100.0f));   /* 单位: 百分之一度 / 2秒 */
+                uart_puts(" cdeg per 2s\r\n");
+                if (ady < 1.0f) {
+                    cal_ok = 1;                             /* <1°/2s: 合格放行 */
+                } else {
+                    uart_puts("[DIAG] drift too high, recalibrating...\r\n");
+                }
+            }
+        }
+        if (cal_ok) {
+            led_err_set(0);           /* 校准+漂移双合格: 红灯灭 */
+            uart_puts("IMU calibrated & drift OK.\r\n");
         } else {
-            led_err_set(0);           /* 校准成功: 红灯灭 */
-            uart_puts("IMU calibrated.\r\n");
+            uart_puts("[ERR] IMU calibrate/drift failed after 3 attempts\r\n");
         }
         led_run_set(0);
     }
@@ -300,7 +333,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [tune-r7: heading-lock OFF, IMU check pending] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [tune-r8: IMU boot self-check] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
