@@ -389,7 +389,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r15: AIM powers servo rail (rule-6 gap fix); HKP default +2.0; ch19=HKP] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r16: blind-lock lag-extrapolation (arc-exit 17-deg left-bias fix, 6/6 field runs)] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
