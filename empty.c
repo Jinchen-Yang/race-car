@@ -222,8 +222,10 @@ static void task_vofa(void)
     gray_get_diag(&g_ok, &g_fail, &g_byte);      /* 灰度 I2C 诊断快照(纯读) */
     uint32_t imu_ok, imu_fail;
     imu_get_diag(&imu_ok, &imu_fail, 0);         /* IMU I2C 诊断快照(纯读) */
+    float hkp;
+    app_tune_get(0, 0, 0, &hkp);                 /* 盲走航向锁 KP 快照(纯读) */
 
-    float ch[19] = {
+    float ch[20] = {
         (float)app_get_state(),          /* ch0: 状态机状态(0=IDLE 1=RUN 2=AIM 3=STOP 4=ESTOP) */
         (float)enc_get_count(ENC_LEFT),  /* ch1: 左轮累计计数(手转轮子应变化 -> 验 QEI) */
         (float)enc_get_count(ENC_RIGHT), /* ch2: 右轮累计计数(验 PA27 中断链路) */
@@ -243,8 +245,9 @@ static void task_vofa(void)
         (float)app_get_mode(),           /* ch16: 运行模式(1=F1巡迹 2=F2定点瞄准 3=F3联动) */
         (float)imu_ok,                   /* ch17: IMU 突发读累计成功 —— 健康时每秒+100 */
         (float)imu_fail,                 /* ch18: IMU 突发读累计失败 —— 和 ch17 的比值=丢包率 */
+        hkp,                             /* ch19: 盲走航向锁 KP —— 按 H/h 应 ±0.5 跳变, 免在乱码里捞'?'回显 */
     };
-    vofa_send(ch, 19);
+    vofa_send(ch, 20);
 }
 
 /* 任务表: { 函数, 周期ms, 计时器(初值=周期), 就绪标志 } —— 周期与交接说明 §4 / app.h 的 APP_*_DT_MS 一致 */
@@ -386,7 +389,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r12: heading-lock live-tune 'H'/'h' (sign field-set), blind-walk closes yaw loop] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r13: VOFA ch19=HKP (watch I19, no more '?' fishing)] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
