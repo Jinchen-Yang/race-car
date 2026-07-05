@@ -56,7 +56,7 @@ extern volatile uint32_t g_tick_ms;
 /* 编码器计数 -> 实测速度(mm/s)换算, 必须分轮——左右解码倍频不同(左 QEI 4倍频/右单相1倍频),
  * 每圈计数已实测并存 encoder.h(左 1017.4 / 右 265.2, 2026-07-03 十圈法)。
  * 每计数毫米数 = 轮周长(π·D) / 每圈计数; 实测速度 = delta * 每计数毫米数 / dt, 单位 mm/s。 */
-#define WHEEL_DIAM_MM     50.0f  /* 2026-07-04 直尺粗测≈5cm; 精标法: 滚动1m整读计数反推(整定阶段做) */
+#define WHEEL_DIAM_MM     47.0f  /* 2026-07-05 实测≈4.7cm; 再精一步的标法: 贴地划线推整 2.00m 读计数反推 */
 #define ENC_L_MM_PER_CNT  (3.1415926f * WHEEL_DIAM_MM / ENC_L_CNT_PER_REV)  /* 左轮 mm/计数 */
 #define ENC_R_MM_PER_CNT  (3.1415926f * WHEEL_DIAM_MM / ENC_R_CNT_PER_REV)  /* 右轮 mm/计数 */
 #define VEL_MEAS_LPF      0.5f   /* 待整定: 测速一阶低通系数(0~1,越小越平滑),抑制编码器抖动(等效参考工程的多点滑窗) */
