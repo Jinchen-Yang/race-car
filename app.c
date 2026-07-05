@@ -397,7 +397,8 @@ void track_loop_step(void)
  *         4) 水平距离 d = √(rx²+ry²), 垂直差 dz = Tz − 云台高;
  *         5) Tilt = atan2(dz, d);
  *         6) 加舵机零点/符号 → 输出目标舵机角, 夹在 0..180。
- * 【依赖占位】AB_LEN_MM/TARGET_X_MM/TARGET_Z_MM/CAR_GIMBAL_*/AIM_*_ZERO_DEG/*_SIGN
+ * 【依赖占位】AB_LEN_MM、TARGET_X_MM、TARGET_Z_MM、CAR_GIMBAL_DX/DY/Z、
+ *           AIM_PAN/TILT_ZERO_DEG、AIM_PAN/TILT_SIGN
  *           均在头部常量组标 "待整定/待标", 场地量了+首次通电试转后回填。
  */
 static void aim_geometry(float *pan_deg, float *tilt_deg)
