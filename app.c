@@ -70,7 +70,10 @@ extern volatile uint32_t g_tick_ms;
 #define WHEEL_SIGN_R     (+1)    /* 待整定: 右轮目标速度符号(占位, 可能取反) */
 
 /* --- 丢线盲走(IMU 航向锁定) --- */
-#define HEADING_KP        0.0f   /* 待整定: 航向误差->转向量 比例(占位) */
+#define HEADING_KP        3.0f   /* 整定中(r5 启用): 航向误差(°)->转向量。⚠符号未实地验证:
+                                  * 若盲走时车迅速拐向一侧甚至打转 = 符号反了, 改成 -3.0 */
+#define HEADING_LPF_A     0.05f  /* 压线期航向滑动平均系数(20ms拍): τ≈0.4s, 滤掉蛇形摆动的
+                                  * 相位, 得到黑线真实走向; 丢线时锁的是这个平均值而非瞬时值 */
 #define LOST_BLIND_MAX    2000   /* 待整定: 盲走最大里程当量, 超限报错(占位) */
 
 /* --- 瞄准 --- */
@@ -133,7 +136,8 @@ static uint32_t g_lost_dist  = 0;   /**< 丢线盲走累计里程当量(超 LOST
 /* --- 速度内环测速滤波(每轮一阶低通状态) --- */
 static float g_meas_filt[2] = {0.0f, 0.0f};   /**< [ENC_LEFT/RIGHT] 测速低通状态,抑抖 */
 /* --- 丢线盲走(IMU 航向锁定)状态 --- */
-static float   g_yaw_lock     = 0.0f;   /**< 丢线瞬间锁定的航向基准(度) */
+static float   g_yaw_lock     = 0.0f;   /**< 丢线时锁定的航向基准(度, 取压线期滑动平均) */
+static float   g_yaw_line_avg = 0.0f;   /**< 压线期航向滑动平均(滤蛇形): 黑线真实走向的估计 */
 static int32_t g_blind_ref    = 0;      /**< 丢线瞬间的里程基准(右轮计数) */
 static uint8_t g_blind_active = 0;      /**< 盲走中标志(抓丢线上升沿,基准只锁一次) */
 /* --- 状态机入态检测 + STOP 声光一次性 --- */
@@ -278,9 +282,12 @@ void vel_loop_step(void)
  */
 static int track_blind_turn(void)
 {
-    /* 刚丢线(上升沿): 锁定当前航向 + 里程基准, 只锁一次(g_blind_active 由 track 压线时清)。 */
+    /* 刚丢线(上升沿): 锁定航向基准 + 里程基准, 只锁一次(g_blind_active 由 track 压线时清)。
+     * ★锁"压线期滑动平均航向"而非瞬时航向: 离线瞬间车头正处在蛇形摆动的随机相位上,
+     * 带着几度偏角, 锁瞬时值会沿偏角走斜线(2026-07-05 实测坐实); 平均值滤掉摆动相位,
+     * 剩下的就是黑线的真实走向, 按它直走才能命中对面胶带首端。 */
     if (!g_blind_active) {
-        g_yaw_lock    = imu_get_yaw();             /* 锁定丢线前航向作为盲走基准 */
+        g_yaw_lock    = g_yaw_line_avg;            /* 锁"线的方向", 不是"车头此刻的方向" */
         g_blind_ref   = enc_get_count(ENC_RIGHT);  /* 里程基准: 右轮 int32 累加值,不回绕 */
         g_blind_active = 1;
     }
@@ -312,10 +319,11 @@ void track_loop_step(void)
 
     int turn;
     if (!lost) {
-        /* 压线: 外环位置式 PID, 目标偏差=0, 实测=err, 出转向量。
-         * ⚠ TRACK_KP/KD 占位; pid_update 内部已做积分/输出限幅。 */
+        /* 压线: 外环位置式 PID, 目标偏差=0, 实测=err, 出转向量。 */
         g_lost_dist = 0;        /* 重新压到线: 清盲走里程 */
         g_blind_active = 0;     /* 解除航向锁, 下次丢线重新锁基准 */
+        /* 持续更新"线的走向"估计: 航向滑动平均, 滤掉蛇形摆动相位(盲走锁它, 见 track_blind_turn) */
+        g_yaw_line_avg += HEADING_LPF_A * (imu_get_yaw() - g_yaw_line_avg);
         turn = (int)pid_update(&g_pid_track, 0.0f, (float)err);
     } else {
         /* 丢线(虚线/弧段): 切 IMU 航向锁定盲走(占位)。 */
@@ -460,6 +468,7 @@ void app_fsm_step(void)
             /* 关键点判定基准快照: 以"此刻"的航向/里程为零点(见 keypoint_event) */
             g_lap_yaw0 = imu_get_yaw();
             g_lap_odo0 = enc_get_count(ENC_RIGHT);
+            g_yaw_line_avg = imu_get_yaw();   /* 线向估计从出发航向起步 */
             /* TODO: 上电自检(电源轨/编码器空转/IMU WHO_AM_I/K230 握手), 失败进 ESTOP。 */
             led_run_set(1);
             if (g_run_mode == 2u) {
