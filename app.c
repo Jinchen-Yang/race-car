@@ -16,6 +16,7 @@
  *   k230.h    : k230_get_aim
  */
 #include <stdint.h>
+#include <math.h>       /* aim_geometry: atan2f/cosf/sinf/sqrtf, ticlang 自带 */
 #include "app.h"
 #include "motor.h"
 #include "pid.h"
@@ -83,8 +84,40 @@ extern volatile uint32_t g_tick_ms;
 #define AIM_TOL_PX        8      /* 待整定: K230 命中容差(像素)(占位) */
 #define AIM_K_PAN         0.02f  /* 待整定: dx->pan 微调增益(符号待标)(占位) */
 #define AIM_K_TILT        0.02f  /* 待整定: dy->tilt 微调增益(符号待标)(占位) */
-#define SERVO_PAN_MID     90.0f  /* 待整定: 云台 PAN 中位角(占位) */
-#define SERVO_TILT_MID    90.0f  /* 待整定: 云台 TILT 中位角(占位) */
+
+/* --- 瞄准几何: 场地/车体/云台坐标(mm) ---
+ * 世界坐标系: 原点=A, x 轴沿 A→B, y 轴垂直 AB 指向靶侧(y>0), z 垂直向上。
+ * F2/F3 对靶时车都停在 B, 车头基本沿 A→B(+x)方向。IMU 出发航向 g_lap_yaw0
+ * 作为世界系的 +x, 当前航向偏差量 = 车头相对 +x 的转角(度)。
+ *
+ * ★不做全场推航: IMU 已知 1°/2s 漂移, 累积到 B 会跑偏 20cm+ (车已跑 5s 以上),
+ *   静态"车在 B"的常量近似比动态积分更靠谱(2026-07-04 firmware-codebase 记忆结论)。 */
+#define AIM_PI            3.14159265358979f
+#define AIM_DEG2RAD(d)    ((d) * (AIM_PI / 180.0f))
+#define AIM_RAD2DEG(r)    ((r) * (180.0f / AIM_PI))
+
+#define AB_LEN_MM         1400.0f  /* 待整定: A→B 直线长度(2024H 同款推测≈1400mm, 与 KP_GATES 一致) */
+#define B_X_MM            AB_LEN_MM /* 车停 B 时的世界 x = AB 长度 */
+#define B_Y_MM            0.0f      /* 车停 B 时的世界 y = 0 (B 在 x 轴上) */
+
+/* 靶位: 题目 PDF 确认"靶距 AB 外侧 50cm, 与 AB 平行", 沿 x 方向落点未硬定 */
+#define TARGET_X_MM       700.0f   /* 待整定: 靶心沿AB方向x坐标(占位=AB中点对面, 场地量) */
+#define TARGET_Y_MM       500.0f   /* PDF 确定: 靶距 AB 外侧 500mm */
+#define TARGET_Z_MM       500.0f   /* 待整定: 靶心离地高度(题目≤500mm, 占位=500) */
+
+/* 云台安装(相对车中心, 车体坐标系): dx 前正、dy 右正、z 离地 */
+#define CAR_GIMBAL_DX_MM   0.0f    /* 待整定: 云台安装前后偏移(前+, 占位=车中心正上) */
+#define CAR_GIMBAL_DY_MM   0.0f    /* 待整定: 云台左右偏移(右+, 占位=车中线) */
+#define CAR_GIMBAL_Z_MM  250.0f    /* 待整定: 云台旋转中心离地高度(车高 250mm, 占位=车顶) */
+
+/* 舵机零点/符号: 与舵机装配朝向相关, 第一次通电试转标定
+ * PAN_ZERO_DEG   = 车头正前方(pan 目标=0°几何角)对应的舵机输入角度
+ * TILT_ZERO_DEG  = 云台水平(tilt=0°几何角)对应的舵机输入角度
+ * _SIGN 若正是"几何角增大, 舵机角也增大"; 若装反了置 -1 */
+#define AIM_PAN_ZERO_DEG   90.0f
+#define AIM_TILT_ZERO_DEG  90.0f
+#define AIM_PAN_SIGN      (+1.0f)  /* 待标: 第一次目视试转, 反了改 -1 */
+#define AIM_TILT_SIGN     (+1.0f)  /* 待标: 同上 */
 
 /* ===== 运行模式(F4: 按键/串口选模式; IDLE 态 MODE 键循环或串口发'1'~'4', RUN 灯闪"模式号"次) =====
  * 1 = F1 自动巡迹一圈回 A 停车(≤30s)
@@ -351,19 +384,61 @@ void track_loop_step(void)
  * ==========================================================================*/
 
 /**
- * @brief 几何反解云台指向(无视觉主路径, 占位)
- * @param pan_deg  [out] 解算出的 PAN 目标角(度)
- * @param tilt_deg [out] 解算出的 TILT 目标角(度)
- * @note  ⚠ 占位给中位。真实实现 = 由当前里程(enc_get_total)+ 航向(imu_get_yaw)
- *        与靶位几何(题目 arena: 靶相对赛道的方位/高度)反解指向角。
- *        待回填: 靶位几何/坐标系/三角公式(test_plan §D); 依赖题目拓扑(ambiguities 未定)。
+ * @brief 几何反解云台指向(无视觉主路径, 2026-07-05 落地真公式)
+ * @param pan_deg  [out] PAN 目标舵机角(度, 0..180)
+ * @param tilt_deg [out] TILT 目标舵机角(度, 0..180)
+ *
+ * 【坐标系】原点=A, x沿A→B, y垂直AB指向靶(y>0), z 垂直向上。
+ * 【假设】F2/F3 对靶时车停在 B; 车头相对世界 +x 的角度 = 当前IMU航向 − 出发航向(度)。
+ *         若真实静止位置不在 B, 只需改 B_X/Y 或加"F2专用车位"常量, 计算不变。
+ * 【流程】1) 由车头朝向把云台安装偏移(车体系)旋转到世界系, 得云台在场上坐标 G=(Gx,Gy);
+ *         2) 靶 T=(TARGET_X, TARGET_Y, TARGET_Z), 相对G水平向量 (rx,ry) = (Tx-Gx, Ty-Gy);
+ *         3) Pan(世界系) = atan2(ry, rx); Pan(车体系) = Pan(世界系) − 车头朝向;
+ *         4) 水平距离 d = √(rx²+ry²), 垂直差 dz = Tz − 云台高;
+ *         5) Tilt = atan2(dz, d);
+ *         6) 加舵机零点/符号 → 输出目标舵机角, 夹在 0..180。
+ * 【依赖占位】AB_LEN_MM/TARGET_X_MM/TARGET_Z_MM/CAR_GIMBAL_*/AIM_*_ZERO_DEG/*_SIGN
+ *           均在头部常量组标 "待整定/待标", 场地量了+首次通电试转后回填。
  */
 static void aim_geometry(float *pan_deg, float *tilt_deg)
 {
-    /* TODO: pan = atan2(靶相对车的横向, 纵向距离) 折算到云台零点;
-     *       tilt = atan2(靶心高 - 云台高, 水平距离)。现全部占位中位。 */
-    *pan_deg  = SERVO_PAN_MID;    /* 占位: 正前方 */
-    *tilt_deg = SERVO_TILT_MID;   /* 占位 */
+    /* 1) 车头朝向(世界系, 弧度): 当前IMU航向减出发航向, wrap 到 (-180,180] 防跨界 */
+    float theta_deg = wrap180(imu_get_yaw() - g_lap_yaw0);
+    float theta = AIM_DEG2RAD(theta_deg);
+    float ct = cosf(theta), st = sinf(theta);
+
+    /* 2) 云台旋转中心的世界坐标 G:
+     *    车中心(B_X, B_Y) + 云台安装偏移(dx,dy)按车头旋转到世界系。 */
+    float Gx = B_X_MM + CAR_GIMBAL_DX_MM * ct - CAR_GIMBAL_DY_MM * st;
+    float Gy = B_Y_MM + CAR_GIMBAL_DX_MM * st + CAR_GIMBAL_DY_MM * ct;
+
+    /* 3) 靶相对云台的水平向量(世界系) */
+    float rx = TARGET_X_MM - Gx;
+    float ry = TARGET_Y_MM - Gy;
+
+    /* 4) Pan: 世界系"云台→靶"方向 − 车头方向 = 车体系水平指向角
+     *    atan2 输出 (-π, π], 减 theta 后再 wrap 一次防溢出 servo 0..180 边界 */
+    float pan_world = atan2f(ry, rx);          /* 弧度 */
+    float pan_body  = pan_world - theta;
+    while (pan_body >  AIM_PI) pan_body -= 2.0f * AIM_PI;
+    while (pan_body < -AIM_PI) pan_body += 2.0f * AIM_PI;
+    float pan = AIM_PAN_ZERO_DEG + AIM_PAN_SIGN * AIM_RAD2DEG(pan_body);
+
+    /* 5) Tilt: 水平距离 vs 垂直高差; 靶高于云台=仰(正), 低于=俯(负) */
+    float d_horiz = sqrtf(rx * rx + ry * ry);
+    float dz = TARGET_Z_MM - CAR_GIMBAL_Z_MM;
+    /* d_horiz≈0 保护: 车恰在靶正下方(几何上不可能, 但 F2 万一放错)则朝天 */
+    float tilt_rad = (d_horiz < 1.0f) ? (AIM_PI * 0.5f) : atan2f(dz, d_horiz);
+    float tilt = AIM_TILT_ZERO_DEG + AIM_TILT_SIGN * AIM_RAD2DEG(tilt_rad);
+
+    /* 6) 夹在舵机可动区间。servo_set_angle 内部还会再限, 这里先夹防负数溢出 int 转换 */
+    if (pan  <   0.0f) pan  =   0.0f;
+    if (pan  > 180.0f) pan  = 180.0f;
+    if (tilt <   0.0f) tilt =   0.0f;
+    if (tilt > 180.0f) tilt = 180.0f;
+
+    *pan_deg  = pan;
+    *tilt_deg = tilt;
 }
 
 /**
