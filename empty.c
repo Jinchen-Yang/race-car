@@ -299,7 +299,8 @@ int main(void)
 
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
-    uart_puts("\r\n--- MSPM0 boot (integrated: app closed-loop, IDLE, press START) ---\r\n");
+    /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
+    uart_puts("\r\n--- MSPM0 boot [tune-r3: KP=0.3] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
