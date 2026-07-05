@@ -221,7 +221,27 @@ static void vel_loop_one(int ch, pid_t *p, float target, float *out)
     /* 3) 累加到该轮下发占空并限幅(增量式必须自己维护累加量)。 */
     *out = clampf(*out + du, VEL_OUT_MIN, VEL_OUT_MAX);
 
-    /* 4) 下发到电机(motor_set 内部带方向/限幅; duty 标度 -1000..1000)。 */
+    /* 4) "瞎油门保险丝"(2026-07-05, 摔坏左编码器实锤的教训): 编码器一瞎, 闭环变成
+     *    瞎子踩油门——占空顶满而测速为零, 轮子实际全速失控。判据: |占空|≥90%上限
+     *    且 |实测|<50mm/s 持续 500ms => 传感器/执行器故障, 急停 + 红灯。 */
+    {
+        static uint16_t s_stall_ms[2] = { 0u, 0u };
+        int fi = (ch == ENC_RIGHT) ? 1 : 0;
+        float mag_out  = (*out < 0.0f) ? -*out : *out;
+        float mag_meas = (meas < 0.0f) ? -meas : meas;
+        if (mag_out >= 0.9f * VEL_OUT_MAX && mag_meas < 50.0f) {
+            s_stall_ms[fi] = (uint16_t)(s_stall_ms[fi] + APP_VEL_DT_MS);
+            if (s_stall_ms[fi] >= 500u) {
+                s_stall_ms[0] = s_stall_ms[1] = 0u;
+                app_estop();   /* 内部停电机断舵机轨, FSM 进 ESTOP(红灯), RESET 才能退出 */
+                return;
+            }
+        } else {
+            s_stall_ms[fi] = 0u;
+        }
+    }
+
+    /* 5) 下发到电机(motor_set 内部带方向/限幅; duty 标度 -1000..1000)。 */
     motor_set(ch, (int)(*out));
 }
 
