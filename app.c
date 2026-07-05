@@ -619,10 +619,16 @@ void app_fsm_step(void)
     case APP_ST_AIM:
         /* 瞄准: 整车停, 云台几何指向 + K230 精修。命中或超时离开。 */
         motor_stop_all();
+        if (entered) {
+            /* 限制⑥: 舵机轨平时断电, 对靶作业期间才供电(r15 补, 此前全工程无人开轨=
+             * MOS 开关装上后会对着断电舵机瞄准)。现红线直连 5V 时本调用无实际效果。 */
+            servo_rail_enable(1);
+        }
         {
             int hit = aim_step_once();
             g_aim_timer += APP_FSM_DT_MS;
             if (hit || g_aim_timer >= AIM_TIMEOUT_MS) {
+                servo_rail_enable(0);   /* 离开对靶 -> 舵机轨断电(F3 续跑/F2 停车都关) */
                 if (g_aim_return_run) {
                     /* F3: 对靶完成, 继续巡迹。重置内环状态, 从静止平滑重加速。 */
                     g_aim_return_run = 0;
