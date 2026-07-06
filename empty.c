@@ -116,7 +116,8 @@ static void task_key(void)
  * 在 VOFA 的发送框里敲单字符命令即可(结尾的\r\n会被忽略)。
  *   '1'~'4' = 设模式(仅待机) | 's' = 启动(仅待机) | 'x' = 急停(任何时候)
  *   'P'/'p' = 循迹 KP 增/减  | 'D'/'d' = KD 增/减 | 'V'/'v' = 基速增/减
- *   'H'/'h' = 盲走航向锁 KP 增/减(±0.5, 唯一可负项, 符号现场判) | '?' = 报状态
+ *   'H'/'h' = 盲走航向锁 KP 增/减(±0.5, 可负) | 'T'/'t' = 右轮配平 ±3(车右偏按T左偏按t)
+ *   '?' = 报状态
  * UART0 未开 RX 中断: 靠 10ms 轮询 + 硬件 RX FIFO 缓冲, 手敲命令绰绰有余。 */
 static void cmd_print_status(void)
 {
@@ -130,6 +131,12 @@ static void cmd_print_status(void)
     uart_puts(" HKPx100=");   /* 航向锁 KP 可为负, 手工打符号(uart_print_u32 只认无符号) */
     if (hkp < 0.0f) { uart_puts("-"); uart_print_u32((uint32_t)(-hkp * 100.0f + 0.5f)); }
     else            {                 uart_print_u32((uint32_t)( hkp * 100.0f + 0.5f)); }
+    {
+        int trim = app_get_trim();
+        uart_puts(" TRIM=");
+        if (trim < 0) { uart_puts("-"); uart_print_u32((uint32_t)(-trim)); }
+        else          {                 uart_print_u32((uint32_t)( trim)); }
+    }
     uart_puts("\r\n");
 }
 static void task_cmd(void)
@@ -156,6 +163,8 @@ static void task_cmd(void)
         case 'v': app_tune_step('v', -1); cmd_print_status(); break;
         case 'H': app_tune_step('h', +1); cmd_print_status(); break;
         case 'h': app_tune_step('h', -1); cmd_print_status(); break;
+        case 'T': app_tune_step('t', +1); cmd_print_status(); break;
+        case 't': app_tune_step('t', -1); cmd_print_status(); break;
         case '?': cmd_print_status(); break;
         default:  break;   /* \r \n 及未知字符: 静默忽略 */
         }
@@ -227,7 +236,7 @@ static void task_vofa(void)
     float blk, blt, bon;
     app_get_blind_debug(&blk, &blt, &bon);       /* 盲走锁定/转向量/压线时长快照(纯读) */
 
-    float ch[23] = {
+    float ch[24] = {
         (float)app_get_state(),          /* ch0: 状态机状态(0=IDLE 1=RUN 2=AIM 3=STOP 4=ESTOP) */
         (float)enc_get_count(ENC_LEFT),  /* ch1: 左轮累计计数(手转轮子应变化 -> 验 QEI) */
         (float)enc_get_count(ENC_RIGHT), /* ch2: 右轮累计计数(验 PA27 中断链路) */
@@ -251,8 +260,9 @@ static void task_vofa(void)
         blk,                             /* ch20: 盲走锁定航向(°) —— 复盘对照 ch12: 差×HKP≈ch21 */
         blt,                             /* ch21: 盲走转向量(mm/s, 压线=0) —— 非零区间即盲走段 */
         bon,                             /* ch22: 连续压线时长(ms) —— 齿高<600=弧末闪断缴械证据 */
+        (float)app_get_trim(),           /* ch23: 右轮占空配平('T'/'t' 调, 每按±3; 调好报值写死) */
     };
-    vofa_send(ch, 23);
+    vofa_send(ch, 24);
 }
 
 /* 任务表: { 函数, 周期ms, 计时器(初值=周期), 就绪标志 } —— 周期与交接说明 §4 / app.h 的 APP_*_DT_MS 一致 */
@@ -394,7 +404,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r23: pure r20 blind behavior (KI off + exit-align off), for drift A/B check] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r24: trim knob T/t (right-duty bias, ch23), align still off per user plan] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

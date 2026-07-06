@@ -132,6 +132,12 @@ extern volatile uint32_t g_tick_ms;
  * 离线节点 = 充分压线(≥HEADING_ONLINE_MIN_MS)后的正式出线锁定(START 首锁不算)。 */
 #define NODE_HIT_MIN_MS   400
 
+/* --- r24 手动配平(治"直线时左时右"的第3味药, 用户批准): 右轮占空恒定偏置,
+ * 串口 'T'(+3)/'t'(-3) 在线调, 夹 ±40。语义: 车向右偏 -> 按 T(右轮加力往左修);
+ * 车向左偏 -> 按 t。无任何自动逻辑, 值断电即失 —— 调好后把 '?' 回显或 ch23 的
+ * 数值报回, 写死进本默认值再烧, 脱机跑才带得走。 --- */
+#define DRIVE_TRIM_DUTY_R  0     /* 待整定: 右轮占空偏置默认值(现场调好后回填) */
+
 /* --- r21A 盲走航向 PI: 速度环退役后左右电机天然差异直通航向, 纯 P 只能"顶住",
  * 顶的结果是恒定航向残差(≈3~5°, 方向随电机差异/电量走 = "时左时右"的来源)。
  * 积分项把恒定不对称学掉, 残差归零。积分每次进盲走清零, 输出限幅防饱和。 --- */
@@ -278,6 +284,7 @@ static float g_track_kp   = TRACK_KP;    /**< 循迹外环 KP(运行时可调) *
 static float g_track_kd   = TRACK_KD;    /**< 循迹外环 KD(运行时可调) */
 static int   g_base_speed = BASE_SPEED;  /**< 巡迹基速 mm/s(运行时可调) */
 static float g_heading_kp = HEADING_KP;  /**< 盲走航向锁 KP(串口 'H'/'h' ±0.5, 可为负) */
+static int   g_trim_duty  = DRIVE_TRIM_DUTY_R; /**< r24: 右轮占空配平('T'/'t' ±3, 夹±40) */
 static uint8_t g_aim_return_run = 0;/**< AIM 结束后回 RUN(F3 中途对靶)还是进 STOP(F2) */
 static int32_t g_run_beep_ms = 0;   /**< RUN 态过点声光剩余时长(ms), 非阻塞关断 */
 
@@ -596,7 +603,8 @@ void track_loop_step(void)
      * "看得见车实际怎么走"的外环自然吸收(这正是速度环用说谎编码器时做不到的)。 */
     {
         int dl = WHEEL_SIGN_L * (int)((float)(g_base_speed - turn) * DUTY_PER_MMS);
-        int dr = WHEEL_SIGN_R * (int)((float)(g_base_speed + turn) * DUTY_PER_MMS);
+        int dr = WHEEL_SIGN_R * (int)((float)(g_base_speed + turn) * DUTY_PER_MMS)
+               + g_trim_duty;   /* r24 配平: 右轮恒定占空偏置, 手调补电机个体差异 */
         g_vel_tgt_l = (float)(g_base_speed - turn);   /* 遥测沿用 ch4/ch6 */
         g_vel_tgt_r = (float)(g_base_speed + turn);
         g_vel_out_l = (float)dl;                      /* 遥测沿用 ch8/ch9 */
@@ -998,11 +1006,21 @@ void app_tune_step(char which, int dir)
         if (g_base_speed < 100) g_base_speed = 100;   /* 下限: 太慢测速量化差 */
         if (g_base_speed > 600) g_base_speed = 600;   /* 上限: 未整定前安全帽 */
     } else if (which == 'h') {
-        /* 盲走航向锁 KP: 唯一允许负值的调参项(符号本身待现场判定), 夹在 ±10 */
+        /* 盲走航向锁 KP: 允许负值的调参项(符号本身待现场判定), 夹在 ±10 */
         g_heading_kp += 0.5f * d;
         if (g_heading_kp >  10.0f) g_heading_kp =  10.0f;
         if (g_heading_kp < -10.0f) g_heading_kp = -10.0f;
+    } else if (which == 't') {
+        /* r24 配平: 右轮占空偏置 ±3/次, 夹 ±40。车右偏按'T', 左偏按't' */
+        g_trim_duty += (dir >= 0) ? 3 : -3;
+        if (g_trim_duty >  40) g_trim_duty =  40;
+        if (g_trim_duty < -40) g_trim_duty = -40;
     }
+}
+
+int app_get_trim(void)
+{
+    return g_trim_duty;   /* 供 VOFA ch23 / '?' 回显; 调好后把值写死进 DRIVE_TRIM_DUTY_R */
 }
 
 void app_tune_get(float *kp, float *kd, int *base, float *hkp)
