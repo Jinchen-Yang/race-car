@@ -792,6 +792,18 @@ void app_fsm_step(void)
                     if (g_run_mode == 4u && (g_lap_count + 1u) < APP_LAPS_MODE4) {
                         g_lap_count++;           /* 发挥3: 过 A 计圈, 继续跑下一圈 */
                         g_kp_idx = 0;
+                        /* r27 每圈过A重锚基准角(仅模式4, 已验证的模式1/3不受影响):
+                         * 陀螺漂移≈7°/圈, 四圈累到20°+会把空白段绝对航向拖歪(CTY 原作
+                         * 靠人工逐圈加修正角)。刚出左弧的车头 ≈ A→B 切线 = 场地几何
+                         * 真值(胶带不漂移), 拿它当新一圈的 z, 漂移逐圈清账;
+                         * ±30° 门限防脏出线污染锚点。 */
+                        {
+                            float ynow = imu_get_yaw();
+                            float derr = wrap180(ynow - g_datum_yaw);
+                            if (derr > -30.0f && derr < 30.0f) {
+                                g_datum_yaw = ynow;
+                            }
+                        }
                     } else {
                         g_state = APP_ST_STOP;   /* 回 A: 完赛停车(F1/F3/第4圈共用) */
                     }
