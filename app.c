@@ -145,6 +145,8 @@ extern volatile uint32_t g_tick_ms;
 /* --- r21B 出线原地对正: 正式出线时车头与锁定方向差超门限, 先原地转正再起步
  * (参考方案 goAtoC "先转到位再直行" 的非阻塞版), 消灭"边走边拉"的横向积累;
  * 失败横穿后的沿用旧锁分支同样受益(转回原切线再走)。 --- */
+#define EXIT_ALIGN_EN       0    /* r23: 出线对正总开关(用户要求回退到纯 r20 行为核对偏移;
+                                  * 置 1 恢复 r21B 的"出线先转正再走") */
 #define EXIT_ALIGN_TH_DEG   6.0f /* 出线锁定时航向差超此值触发对正 */
 #define EXIT_ALIGN_DONE_DEG 3.0f /* 对正到差值以内交还直行 */
 #define EXIT_ALIGN_MAX_MS   800  /* 对正超时保险: 超时放弃, 按当前航向直接走 */
@@ -443,6 +445,7 @@ static int track_blind_turn(void)
         g_blind_active = 1;
         g_online_ms   = 0;                         /* 下段压线重新计时 */
         g_head_integ  = 0.0f;                      /* r21A: 新盲走段, 航向积分清零 */
+#if EXIT_ALIGN_EN
         {
             /* r21B: 车头与锁定方向差超门限 -> 请求原地对正(track_loop 执行) */
             float e0 = wrap180(g_yaw_lock - imu_get_yaw());
@@ -450,6 +453,7 @@ static int track_blind_turn(void)
                 g_align_ms = EXIT_ALIGN_MAX_MS;
             }
         }
+#endif
     }
 
     /* 航向锁定: 用"基准航向 - 当前航向"的误差算转向量, 让车沿丢线前的方向直走,

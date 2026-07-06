@@ -394,7 +394,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r22: heading-KI OFF (pure P, r20 straight behavior) + exit align-pivot kept] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r23: pure r20 blind behavior (KI off + exit-align off), for drift A/B check] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
