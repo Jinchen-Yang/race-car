@@ -404,7 +404,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r24: trim knob T/t (right-duty bias, ch23), align still off per user plan] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r25: CTY-arch rebuild: DeltaYaw core / gray ladder / seg-FSM / abs headings z & z+180] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

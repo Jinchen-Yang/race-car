@@ -61,11 +61,20 @@ extern volatile uint32_t g_tick_ms;
 #define ENC_R_MM_PER_CNT  (3.1415926f * WHEEL_DIAM_MM / ENC_R_CNT_PER_REV)  /* 右轮 mm/计数 */
 #define VEL_MEAS_LPF      0.5f   /* 待整定: 测速一阶低通系数(0~1,越小越平滑),抑制编码器抖动(等效参考工程的多点滑窗) */
 
-/* --- 循迹外环(位置式 PID) --- */
-#define TRACK_KP          0.4f   /* 整定中: r1=1.0蛇形 r2=0.5蛇形 r3=0.3摆小但弯道拉不住 r4=0.4+KD */
-#define TRACK_KD          1.0f   /* 整定中: r4 首次引入, 抑制 KP 回抬带来的摆动; 抖得高频再减半 */
-#define TRACK_OUT_LIM   (400.0f) /* 待整定: 转向量限幅(占位) */
-#define BASE_SPEED        300    /* 待整定: 巡迹基速, 单位 mm/s(=0.3m/s, 起步偏保守; 换算已定标, 单位从"当量"变真实物理量) */
+/* --- r25 SelfTurn 转向环(CTY 架构: 统一吃 DeltaYaw°, 出差速占空) --- */
+#define TRACK_KP          3.0f   /* SelfTurn P: 占空差/°; dy=40° 时差速 120('P/p'±0.5 在线调) */
+#define TRACK_KD          2.0f   /* SelfTurn D: 抑制查表台阶跳变的momentum('D/d'±1 在线调) */
+#define TRACK_OUT_LIM   (400.0f) /* (遗留, 仅供闲置的 g_pid_track 初始化) */
+#define BASE_SPEED        150    /* ⚠r25 语义变更: 巡航"占空"(不再是 mm/s)! ≈300mm/s.
+                                  * 'V/v' ±10 在线调, 夹 [60,300] */
+/* --- r25 段状态机(CTY Task4StateUpdate 移植) --- */
+#define LAP_CW            1      /* 题目正式路线 A→B 先行 = 顺时针圈(两弧皆右转); 反向跑改0 */
+#define TURN_DIFF_LIM     150    /* SelfTurn 差速限幅(占空) */
+#define SEG_LINE_TH       0x08   /* 漏积分 ≤此 = 确认在线(≈3个有线帧, 60ms) */
+#define SEG_BLANK_TH      0x10   /* 漏积分 ≥此 = 确认空白(16空白帧≈320ms) */
+#define START_PROTECT_MS  1500   /* 起步保护: 强制seg0+无视灰度(A点残端免疫) */
+#define TRANS_PROTECT_MS  1000   /* 段切换保护窗: 窗内禁再切+弧内丢线强拐生效期 */
+#define ARC_SEARCH_DEG    50.0f  /* 弧内丢线强拐角(CTY ±50): 方向取弧内侧 */
 /* 左右轮安装多为镜像, 整车直行需对其中一轮取反: 这两个符号现场标定。 */
 #define WHEEL_SIGN_L     (+1)    /* 待整定: 左轮目标速度符号(占位, 可能取反) */
 #define WHEEL_SIGN_R     (+1)    /* 待整定: 右轮目标速度符号(占位, 可能取反) */
@@ -136,7 +145,7 @@ extern volatile uint32_t g_tick_ms;
  * 串口 'T'(+3)/'t'(-3) 在线调, 夹 ±40。语义: 车向右偏 -> 按 T(右轮加力往左修);
  * 车向左偏 -> 按 t。无任何自动逻辑, 值断电即失 —— 调好后把 '?' 回显或 ch23 的
  * 数值报回, 写死进本默认值再烧, 脱机跑才带得走。 --- */
-#define DRIVE_TRIM_DUTY_R  0     /* 待整定: 右轮占空偏置默认值(现场调好后回填) */
+#define DRIVE_TRIM_DUTY_R  -4     /* 待整定: 右轮占空偏置默认值(现场调好后回填) */
 
 /* --- r21A 盲走航向 PI: 速度环退役后左右电机天然差异直通航向, 纯 P 只能"顶住",
  * 顶的结果是恒定航向残差(≈3~5°, 方向随电机差异/电量走 = "时左时右"的来源)。
@@ -265,8 +274,14 @@ static uint8_t g_acq_cnt      = 0;      /**< r19: 盲走中连续在线帧计数
 static uint8_t g_lock_valid   = 0;      /**< r19: 已有一次正式锁定(短压线再丢线时沿用旧锁, 防污染重锁) */
 static float    g_head_integ  = 0.0f;   /**< r21A: 盲走航向积分(°·s), 每次进盲走清零 */
 static uint16_t g_align_ms    = 0;      /**< r21B: 出线原地对正剩余时限 ms(0=不在对正) */
-static uint16_t g_pivot_ms    = 0;      /**< r20: 捕线强转剩余时限 ms(0=不在强转) */
-static int8_t  g_pivot_dir    = 0;      /**< r20: 强转方向 +1=线在右侧顺时针原地转 / -1=反 */
+static uint16_t g_pivot_ms    = 0;      /**< (r20 遗留, r25 起未用) */
+/* --- r25 CTY 段状态机 --- */
+static uint8_t  g_seg         = 0;      /**< 当前段 0=A→B空白 1=B→C弧 2=C→D空白 3=D→A弧 */
+static uint8_t  g_nodata      = 0xFF;   /**< CTY 漏积分丢线计数(空白帧++, 有线帧减半) */
+static float    g_datum_yaw   = 0.0f;   /**< 出发基准角 z = START 时车头(=A→B 方向)绝对航向 */
+static uint16_t g_protect_ms  = 0;      /**< 段切换保护窗(ms) */
+static uint16_t g_startprot_ms = 0;     /**< 起步保护(ms): 强制 seg0+无视灰度 */
+static float    g_dyaw_prev   = 0.0f;   /**< SelfTurn D 项上拍 DeltaYaw */
 static uint8_t g_node_pending = 0;      /**< r20: 待 FSM 消费的节点事件数(track 写, FSM 读, 同主循环无竞态) */
 static uint8_t g_node_hit_fired = 0;    /**< r20: 本次压线的"压线节点"已发过(one-shot) */
 /* --- 状态机入态检测 + STOP 声光一次性 --- */
@@ -413,89 +428,41 @@ void vel_loop_step(void)
 }
 
 /* ============================================================================
- *  循迹外环 —— 灰度闭环 + 丢线 IMU 航向锁定
+ *  r25 驱动核心 —— CTY(24H第四问开源) 架构移植: 统一航向误差接口
+ *  (用户 2026-07-05 拍板: 弃自研"出线锁航向"体系, 按拿奖开源重构)
+ *
+ *  一切控制汇聚成一个量 DeltaYaw(°, 车头还需转多少, 左正右负):
+ *    空白直线段: DeltaYaw = wrap180(段目标绝对航向 − 当前航向)
+ *                段目标 = 出发基准角 z(A→B) / z+180(C→D) —— 场地几何锚定,
+ *                彻底不依赖"出线瞬间锁的航向"(旧架构一切玄学问题的源头)
+ *    弧线段循线: DeltaYaw = 灰度查表(哪路压线→偏差角 ±5/15/25/40°, CTY 实测梯度)
+ *    弧内丢线:   保护窗内向弧内侧强拐 ARC_SEARCH_DEG 找线
+ *  然后 SelfTurn PD 出差速, 开环占空执行(编码器仍不参与控制)。
+ *
+ *  段状态机(一圈恰 4 段; 起点=A, 车头手动对准 B):
+ *    seg0 A→B空白(目标z) → seg1 B→C弧(循线) → seg2 C→D空白(目标z+180)
+ *    → seg3 D→A弧(循线) → 回 seg0(=过A, FSM 计圈/停车)
+ *  切换判据 = CTY 漏积分计数 g_nodata: 空白帧(0xFF/0x00)自增, 有线帧减半
+ *  (快认线/慢认空, 天然去抖); 每次切换发节点事件(FSM 声光/路由)并开保护窗。
+ *  起步保护 1.5s 强制 seg0+无视灰度(A 点胶带残端免疫)。
  * ==========================================================================*/
 
 /**
- * @brief 丢线盲走转向量(内部用): IMU 航向锁定占位
- * @return 转向量(叠加到基速做差速); 占位返回 0(直行)
- * @note  ⚠ 占位: 真实实现 = 锁定丢线前航向 yaw0, 用 imu_get_yaw() 算航向误差,
- *        HEADING_KP * 误差 出转向量; 并累加 g_lost_dist, 超 LOST_BLIND_MAX 报错。
- *        待整定: HEADING_KP、航向锁定基准、里程门限。
+ * @brief 灰度字节 -> 航向偏差角查表(CTY 130 速档实测梯度)
+ * @note  bit=0=压线(黑); bit0=最左探头(1号朝左, 实车已验向)。线在左=应左转=正角。
  */
-static int track_blind_turn(void)
+static float gray_ladder(uint8_t b)
 {
-    /* 刚丢线(上升沿): 锁定航向基准 + 里程基准, 只锁一次(g_blind_active 由 track 压线时清)。
-     * ★锁"压线期滑动平均航向"而非瞬时航向: 离线瞬间车头正处在蛇形摆动的随机相位上,
-     * 带着几度偏角, 锁瞬时值会沿偏角走斜线(2026-07-05 实测坐实); 平均值滤掉摆动相位,
-     * 剩下的就是黑线的真实走向, 按它直走才能命中对面胶带首端。 */
-    if (!g_blind_active) {
-        if (g_online_ms < HEADING_ONLINE_MIN_MS && g_lock_valid) {
-            /* r19: 短暂压线(<0.6s)后又丢线 = 大概率"横穿对面胶带没接上"——压线期
-             * 车头乱摆, 平均值是垃圾。沿用上一次锁定值按原方向继续直走, 把"一次
-             * 没接上"降级为"在弧更远处再相遇"。(审计定案: "失败横穿→污染重锁→
-             * 更斜入射→再失败"这个循环就是'转圈'的闭合机制, 在此拆环。)
-             * 顺带福利: 真赛道虚线段的每个空档都会沿用第一次的锁定, 全程一根直线。 */
-        } else {
-            /* 充分压线后的正式出线: 锁"线的方向"(快/慢双平均+滞后外推), 不是
-             * "车头此刻的方向"。恒速转弯时外推 0.5(fast-slow) 精确消滞后;
-             * 直线出线时 fast≈slow 自动退化为纯平均。夹 ±25° 防噪声放大。 */
-            float extrap = 0.5f * (g_yaw_line_avg_f - g_yaw_line_avg);
-            extrap = clampf(extrap, -HEADING_EXTRAP_LIM, HEADING_EXTRAP_LIM);
-            g_yaw_lock   = g_yaw_line_avg_f + extrap;
-            g_lock_valid = 1;
-            if (g_online_ms >= HEADING_ONLINE_MIN_MS) {
-                g_node_pending++;   /* r20 离线节点: 正式出线才算(C/A 点); START 首锁不算 */
-            }
-        }
-        g_blind_ref   = enc_get_count(ENC_RIGHT);  /* 里程基准: 右轮 int32 累加值,不回绕 */
-        g_blind_active = 1;
-        g_online_ms   = 0;                         /* 下段压线重新计时 */
-        g_head_integ  = 0.0f;                      /* r21A: 新盲走段, 航向积分清零 */
-#if EXIT_ALIGN_EN
-        {
-            /* r21B: 车头与锁定方向差超门限 -> 请求原地对正(track_loop 执行) */
-            float e0 = wrap180(g_yaw_lock - imu_get_yaw());
-            if (e0 > EXIT_ALIGN_TH_DEG || e0 < -EXIT_ALIGN_TH_DEG) {
-                g_align_ms = EXIT_ALIGN_MAX_MS;
-            }
-        }
-#endif
-    }
-
-    /* 航向锁定: 用"基准航向 - 当前航向"的误差算转向量, 让车沿丢线前的方向直走,
-     * 平稳穿过虚线/弧段(而非瞎猜)。wrap180 处理 ±180 跨界。
-     * 符号判据(2026-07-05): 手转车头向左(俯视逆时针)90° 看 ch12:
-     *   ch12 变大(+90) -> KP 取正; ch12 变小(-90) -> KP 取负。
-     * 推导: turn>0 使右轮目标更高 = 车头向左; 车头已偏左(此时误差项与 ch12 同号变化)
-     *   需要 turn 反号拉回, 由 KP 符号保证负反馈。增益量级: 残余 0.6% 轮速失配
-     *   等效 turn≈1mm/s, KP=2 时稳态航向误差≈0.5°, 2~4 足够, 过大(>8)恐振荡。 */
-    float yaw = imu_get_yaw();
-    float e   = wrap180(g_yaw_lock - yaw);
-    int turn;
-    if (HEADING_KI > 0.001f) {
-        /* r21A PI(现默认停用, 见 HEADING_KI 注释): I 学掉左右电机恒定不对称 */
-        g_head_integ += e * ((float)APP_TRACK_DT_MS / 1000.0f);
-        {
-            float ilim = HEADING_INTEG_LIM / HEADING_KI;
-            g_head_integ = clampf(g_head_integ, -ilim, ilim);
-        }
-        turn = (int)(g_heading_kp * e + HEADING_KI * g_head_integ);
-    } else {
-        turn = (int)(g_heading_kp * e);   /* r22: 纯 P, 与 r20 直线行为完全一致 */
-    }
-    /* r17 硬限幅: 减灾 —— 坏锁定值最多走 R≈21cm 缓弧 */
-    if (turn >  HEADING_TURN_LIM) turn =  HEADING_TURN_LIM;
-    if (turn < -HEADING_TURN_LIM) turn = -HEADING_TURN_LIM;
-    g_blind_turn_dbg = (float)turn;   /* 遥测: VOFA ch21 */
-
-    /* 盲走里程 = |当前右轮计数 - 基准|; 超上限说明虚线/弧段异常(压根没接回线), 报错。 */
-    int32_t d = enc_get_count(ENC_RIGHT) - g_blind_ref;
-    g_lost_dist = (uint32_t)(d < 0 ? -d : d);
-    if (g_lost_dist > LOST_BLIND_MAX) {
-        led_err_set(1);   /* TODO: 盲走超限 -> 可选进 STOP/ESTOP, 现仅点错误灯示警 */
-    }
-    return turn;
+    if (!(b & 0x01)) return +40.0f;
+    if (!(b & 0x80)) return -40.0f;
+    if (!(b & 0x02)) return +25.0f;
+    if (!(b & 0x40)) return -25.0f;
+    if (!(b & 0x04)) return +15.0f;
+    if (!(b & 0x20)) return -15.0f;
+    if (!(b & 0x08) && !(b & 0x10)) return 0.0f;   /* 中间两路都压 = 正中 */
+    if (!(b & 0x08)) return +5.0f;
+    if (!(b & 0x10)) return -5.0f;
+    return 0.0f;   /* 全白兜底(调用方已挡) */
 }
 
 void track_loop_step(void)
@@ -504,120 +471,83 @@ void track_loop_step(void)
         return;
     }
 
-    /* 灰度加权质心偏差(居中≈0, 符号见标定); gray_get_error 内部刷新一次并更新丢线标志,
-     * 紧接着用 gray_is_lost() 查本次是否全丢线(全黑/全白)。 */
-    int err  = (int)gray_get_error();
-    int lost = (int)gray_is_lost();
+    /* 1) 灰度取数: gray_get_error 刷一次 I2C(质心值仅供 ch10 遥测), 原始字节走
+     *    diag 通道取。字节语义: bit=0=压线(黑), 0xFF=全白, 0x00=全黑/失联。 */
+    (void)gray_get_error();
+    uint8_t byte = 0xFF;
+    gray_get_diag(0, 0, &byte);
 
-    /* r19 盲走解锁去抖: 盲走中出现的在线帧要连续 TRACK_ACQ_N 帧才算"确认重新压线";
-     * 1~2 帧闪断(弧末线骑传感器边缘的常态)不解锁、不喂平均、继续按原锁定走。 */
-    if (!lost) {
-        if (g_blind_active) {
-            g_acq_cnt++;
-            if (g_acq_cnt >= TRACK_ACQ_N) {
-                g_blind_active = 0;
-                g_acq_cnt = 0;
-                /* re-base: 上一段线的方向数据对新一段是污染源(可能差 30~180°),
-                 * 两个平均从当前航向重新起步, 压线计时也重启。 */
-                g_yaw_line_avg = g_yaw_line_avg_f = imu_get_yaw();
-                g_online_ms = 0;
-                g_node_hit_fired = 0;
-                g_align_ms = 0;      /* r21B: 已重新压线, 撤销未完成的对正请求 */
-                /* r20 捕线强转: 斜插进线(|err| 在边缘)时先原地对正再交 PID,
-                 * 防"横穿而不捕获"(参考方案的进弧强制转向, 非阻塞版)。 */
-                if (err > CAPTURE_ERR_TH || err < -CAPTURE_ERR_TH) {
-                    g_pivot_ms  = CAPTURE_PIVOT_MAX_MS;
-                    g_pivot_dir = (err > 0) ? (int8_t)1 : (int8_t)-1;
-                }
-            }
-        }
-    } else {
-        g_acq_cnt = 0;
-        g_pivot_ms = 0;    /* 强转途中转丢线: 放弃强转, 交回盲走 */
+    /* 2) CTY 漏积分丢线计数: 空白帧自增(封顶), 有线帧减半 —— 快认线/慢认空 */
+    if (byte == 0xFF || byte == 0x00) {
+        if (g_nodata < 0xFF) g_nodata++;
+    } else if (g_nodata > 0) {
+        g_nodata >>= 1;
     }
 
-    int turn;
-    if (!lost && !g_blind_active) {
-        /* --- r20 捕线强转小状态: 原地转向把线转到传感器中央, 再交 PID --- */
-        if (g_pivot_ms > 0) {
-            g_pivot_ms = (g_pivot_ms > APP_TRACK_DT_MS)
-                       ? (uint16_t)(g_pivot_ms - APP_TRACK_DT_MS) : 0u;
-            if (err > -CAPTURE_DONE_TH && err < CAPTURE_DONE_TH) {
-                g_pivot_ms = 0;                    /* 已对正, 交还 PID */
-            } else {
-#if DRIVE_OPEN_LOOP
-                /* 原地转: err>0(线在右) -> 左轮进右轮退 = 顺时针 */
-                motor_set(MOTOR_LEFT,  WHEEL_SIGN_L * (int)g_pivot_dir * CAPTURE_PIVOT_DUTY);
-                motor_set(MOTOR_RIGHT, -(WHEEL_SIGN_R * (int)g_pivot_dir * CAPTURE_PIVOT_DUTY));
-#endif
-                return;   /* 强转期间: 不喂平均/不计时/不跑 PID */
-            }
-        }
-        /* 确认压线: 外环位置式 PID + 弧上曲率前馈(见 TRACK_FF_GAIN 推导)。 */
-        g_lost_dist = 0;        /* 清盲走里程 */
-        g_blind_turn_dbg = 0.0f;/* 遥测: 压线期 ch21 归零, 波形上一眼看出盲走区间 */
-        if (g_online_ms < 10000u) {
-            g_online_ms = (uint16_t)(g_online_ms + APP_TRACK_DT_MS);  /* 连续压线计时(1万ms封顶) */
-        }
-        /* r20 压线节点: 连续压线达门限发一次事件(B/D 点), FSM 负责声光/路由 */
-        if (!g_node_hit_fired && g_online_ms >= NODE_HIT_MIN_MS) {
-            g_node_hit_fired = 1;
+    /* 3) 起步保护: 强制 seg0 + 无视灰度(A 点残端/起步抖动免疫, CTY BeginProtect) */
+    if (g_startprot_ms > 0u) {
+        g_startprot_ms = (g_startprot_ms > APP_TRACK_DT_MS)
+                       ? (uint16_t)(g_startprot_ms - APP_TRACK_DT_MS) : 0u;
+        g_seg = 0;
+        g_nodata = 0xFF;
+    }
+
+    /* 4) 切换保护窗递减(CTY ProtectFlag: 切换后一段时间禁止再切, 防抖) */
+    if (g_protect_ms > 0u) {
+        g_protect_ms = (g_protect_ms > APP_TRACK_DT_MS)
+                     ? (uint16_t)(g_protect_ms - APP_TRACK_DT_MS) : 0u;
+    }
+
+    /* 5) 段切换: 每次切换 = 一个节点事件(B/C/D/A), FSM 消费(声光/AIM/计圈/停车) */
+    if (g_protect_ms == 0u && g_startprot_ms == 0u) {
+        uint8_t lined = (uint8_t)(g_nodata <= SEG_LINE_TH);
+        uint8_t blank = (uint8_t)(g_nodata >= SEG_BLANK_TH);
+        if ((g_seg == 0u || g_seg == 2u) && lined) {
+            g_seg++;                                    /* 0→1 到B / 2→3 到D */
+            g_protect_ms = TRANS_PROTECT_MS;
+            g_node_pending++;
+        } else if ((g_seg == 1u || g_seg == 3u) && blank) {
+            g_seg = (uint8_t)((g_seg + 1u) & 0x03u);    /* 1→2 过C / 3→0 回A */
+            g_protect_ms = TRANS_PROTECT_MS;
             g_node_pending++;
         }
-        /* 持续更新"线的走向"估计: 快/慢两个航向滑动平均(盲走锁其外推组合, 见 track_blind_turn) */
-        float y = imu_get_yaw();
-        g_yaw_line_avg   += HEADING_LPF_A      * (y - g_yaw_line_avg);
-        g_yaw_line_avg_f += HEADING_LPF_A_FAST * (y - g_yaw_line_avg_f);
-        /* 曲率前馈: 快慢平均差正比当前转速, 接管弧上稳态转向, 让 PID 只管瞬态,
-         * 稳态偏差→0, 线回传感器中央(弧末闪断/提前掉线的根治)。直线段自动归零。 */
-        float ff = clampf(TRACK_FF_GAIN * (g_yaw_line_avg_f - g_yaw_line_avg),
-                          -TRACK_FF_LIM, TRACK_FF_LIM);
-        turn = (int)(pid_update(&g_pid_track, 0.0f, (float)err) + ff);
-    } else {
-        /* r21B 出线原地对正: 车头未对齐锁定方向时先原地转正, 再起步直走。
-         * 消灭"边走边被 P 环慢慢拉"造成的横向偏移积累(B 出去够不到 C 的元凶)。 */
-        if (g_align_ms > 0u) {
-            float ea = wrap180(g_yaw_lock - imu_get_yaw());
-            g_align_ms = (g_align_ms > APP_TRACK_DT_MS)
-                       ? (uint16_t)(g_align_ms - APP_TRACK_DT_MS) : 0u;
-            if (ea > -EXIT_ALIGN_DONE_DEG && ea < EXIT_ALIGN_DONE_DEG) {
-                g_align_ms = 0;                      /* 已对正, 落回正常盲走直行 */
-            } else if (g_align_ms > 0u) {
-#if DRIVE_OPEN_LOOP
-                /* ea>0 需左转: 左轮退右轮进(原地旋转, 不前进) */
-                int d = (ea > 0.0f) ? CAPTURE_PIVOT_DUTY : -CAPTURE_PIVOT_DUTY;
-                motor_set(MOTOR_LEFT,  -(WHEEL_SIGN_L * d));
-                motor_set(MOTOR_RIGHT,  (WHEEL_SIGN_R * d));
-#endif
-                g_blind_turn_dbg = (ea > 0.0f) ? 999.0f : -999.0f;  /* 遥测: ±999=对正段醒目标记 */
-                return;   /* 对正期间不走输出级 */
-            }
-        }
-        /* 丢线 或 在线未过去抖(闪断嫌疑期): IMU 航向锁定盲走。 */
-        turn = track_blind_turn();
     }
 
-#if DRIVE_OPEN_LOOP
-    /* r20 直驱输出级: 基速±转向量(mm/s 量纲, 全部原有增益沿用) -> 占空 -> 电机。
-     * 编码器不再参与; 直线靠航向锁闭环、弧线靠灰度闭环, 左右电机差异由这两个
-     * "看得见车实际怎么走"的外环自然吸收(这正是速度环用说谎编码器时做不到的)。 */
+    /* 6) 统一航向误差 DeltaYaw(°, 左正) —— 本架构唯一的控制接口 */
+    float yaw = imu_get_yaw();
+    float dy;
+    if (g_seg == 0u) {
+        dy = wrap180(g_datum_yaw - yaw);                /* A→B: 出发基准角 z */
+    } else if (g_seg == 2u) {
+        dy = wrap180(g_datum_yaw + 180.0f - yaw);       /* C→D: z+180(反向) */
+    } else if (byte != 0xFF && byte != 0x00) {
+        dy = gray_ladder(byte);                         /* 弧上循线: 查表 */
+    } else if (g_protect_ms > 0u) {
+        /* 刚进弧就丢线(冲过线头): 保护窗内向弧内侧强拐找线(CTY 手法) */
+        dy = LAP_CW ? -ARC_SEARCH_DEG : +ARC_SEARCH_DEG;
+    } else {
+        dy = 0.0f;                                      /* 弧上短暂全白: 保持直走 */
+    }
+
+    /* 7) SelfTurn PD -> 差速占空('P/p' 调 KP ±0.5, 'D/d' 调 KD ±1) */
+    float diff_f = g_track_kp * dy + g_track_kd * (dy - g_dyaw_prev);
+    g_dyaw_prev = dy;
+    int diff = (int)clampf(diff_f, -(float)TURN_DIFF_LIM, (float)TURN_DIFF_LIM);
+
+    /* 8) 输出: 开环占空差速(dy>0=左转=右轮加左轮减; 'V/v' 调基速占空 ±10) */
     {
-        int dl = WHEEL_SIGN_L * (int)((float)(g_base_speed - turn) * DUTY_PER_MMS);
-        int dr = WHEEL_SIGN_R * (int)((float)(g_base_speed + turn) * DUTY_PER_MMS)
-               + g_trim_duty;   /* r24 配平: 右轮恒定占空偏置, 手调补电机个体差异 */
-        g_vel_tgt_l = (float)(g_base_speed - turn);   /* 遥测沿用 ch4/ch6 */
-        g_vel_tgt_r = (float)(g_base_speed + turn);
-        g_vel_out_l = (float)dl;                      /* 遥测沿用 ch8/ch9 */
+        int dl = WHEEL_SIGN_L * (g_base_speed - diff);
+        int dr = WHEEL_SIGN_R * (g_base_speed + diff) + g_trim_duty;
+        g_vel_tgt_l = dy;                  /* 遥测 ch4 = DeltaYaw(°) */
+        g_vel_tgt_r = (float)g_seg;        /* 遥测 ch6 = 当前段号 0..3 */
+        g_vel_out_l = (float)dl;           /* 遥测 ch8/ch9 = 实发占空 */
         g_vel_out_r = (float)dr;
         motor_set(MOTOR_LEFT,  dl);
         motor_set(MOTOR_RIGHT, dr);
     }
-#else
-    /* 串级: 基速 ± 转向量 -> 左右目标速度(带安装符号补偿); 写给内环执行。
-     * ⚠ WHEEL_SIGN_L/R 现场标定(镜像安装可能其一取反)。基速用运行时副本(串口可调)。 */
-    g_vel_tgt_l = (float)(WHEEL_SIGN_L * (g_base_speed - turn));
-    g_vel_tgt_r = (float)(WHEEL_SIGN_R * (g_base_speed + turn));
-#endif
+    g_blind_turn_dbg = (float)diff;        /* 遥测 ch21 = 差速 */
+    g_yaw_lock = (g_seg == 0u) ? g_datum_yaw
+               : (g_seg == 2u) ? wrap180(g_datum_yaw + 180.0f) : yaw;  /* ch20 = 当前段目标 */
 }
 
 /* ============================================================================
@@ -802,6 +732,14 @@ void app_fsm_step(void)
             g_node_hit_fired = 0;
             g_head_integ = 0.0f;
             g_align_ms = 0;
+            /* r25 CTY 段状态机复位 + 基准角快照: 车此刻手动对准 A→B 方向,
+             * 这一记 yaw 就是全圈两段空白直线的绝对航向锚(z 与 z+180)。 */
+            g_datum_yaw = imu_get_yaw();
+            g_seg = 0;
+            g_nodata = 0xFF;
+            g_protect_ms = 0;
+            g_startprot_ms = START_PROTECT_MS;
+            g_dyaw_prev = 0.0f;
             /* r19 卫生项(审计): 消费搬车期间滞留的编码器增量 + 清测速滤波,
              * 防起步首拍速度环吃到 ±1500 假速度脉冲(非 RUN 态无人读 delta, 会攒一大坨) */
             (void)enc_get_delta(ENC_LEFT);
@@ -994,17 +932,17 @@ void app_tune_step(char which, int dir)
      * KP/KD 直接热改 g_pid_track 的增益字段, 下一拍外环立即生效。 */
     float d = (dir >= 0) ? 1.0f : -1.0f;
     if (which == 'p') {
-        g_track_kp += 0.05f * d;
+        g_track_kp += 0.5f * d;                       /* r25: SelfTurn KP(占空差/°) */
         if (g_track_kp < 0.0f) g_track_kp = 0.0f;
         g_pid_track.kp = g_track_kp;
     } else if (which == 'd') {
-        g_track_kd += 0.25f * d;
+        g_track_kd += 1.0f * d;                       /* r25: SelfTurn KD */
         if (g_track_kd < 0.0f) g_track_kd = 0.0f;
         g_pid_track.kd = g_track_kd;
     } else if (which == 'v') {
-        g_base_speed += (dir >= 0) ? 25 : -25;
-        if (g_base_speed < 100) g_base_speed = 100;   /* 下限: 太慢测速量化差 */
-        if (g_base_speed > 600) g_base_speed = 600;   /* 上限: 未整定前安全帽 */
+        g_base_speed += (dir >= 0) ? 10 : -10;        /* r25: 巡航占空 */
+        if (g_base_speed < 60)  g_base_speed = 60;    /* 下限: 太慢过不了弧 */
+        if (g_base_speed > 300) g_base_speed = 300;   /* 上限: 60%限幅的一半, 安全帽 */
     } else if (which == 'h') {
         /* 盲走航向锁 KP: 允许负值的调参项(符号本身待现场判定), 夹在 ±10 */
         g_heading_kp += 0.5f * d;
@@ -1094,6 +1032,13 @@ void app_init(void)
     g_node_hit_fired = 0;
     g_head_integ = 0.0f;
     g_align_ms = 0;
+    g_seg = 0;
+    g_nodata = 0xFF;
+    g_datum_yaw = 0.0f;
+    g_protect_ms = 0;
+    g_startprot_ms = 0;
+    g_dyaw_prev = 0.0f;
+    g_blind_ref = 0;   /* (遗留字段, 保持归零) */
     g_stop_beep_ms = 0;
     g_prev_state = APP_ST_IDLE;
     g_state = APP_ST_IDLE;
