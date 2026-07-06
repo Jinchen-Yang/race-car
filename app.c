@@ -70,9 +70,15 @@ extern volatile uint32_t g_tick_ms;
 /* --- r25 段状态机(CTY Task4StateUpdate 移植) --- */
 #define LAP_CW            1      /* 题目正式路线 A→B 先行 = 顺时针圈(两弧皆右转); 反向跑改0 */
 #define TURN_DIFF_LIM     150    /* SelfTurn 差速限幅(占空) */
-#define SEG_LINE_TH       0x08   /* 漏积分 ≤此 = 确认在线(≈3个有线帧, 60ms) */
+#define SEG_LINE_TH       0x3F   /* 漏积分 ≤此 = 确认在线。r30: 8→63 —— 300mm/s 垂直冲过
+                                  * 1.8cm 胶带线只在传感器下停留 ~60ms=3帧, 旧值要 5 帧,
+                                  * 数学上注定"正着冲线认不出"(碰线直走实锤)。63=3帧即认;
+                                  * 单帧噪声(255→127)仍差一倍不会误触, 误进弧模式也有
+                                  * 强拐找线自愈。 */
 #define SEG_BLANK_TH      0x10   /* 漏积分 ≥此 = 确认空白(16空白帧≈320ms) */
-#define START_PROTECT_MS  1500   /* 起步保护: 强制seg0+无视灰度(A点残端免疫) */
+#define START_PROTECT_MS  800    /* 起步保护: 强制seg0+无视灰度(A点残端免疫)。
+                                  * r30: 1500→800, 允许离弧线 ≥30cm 处起步测试;
+                                  * ⚠此窗内撞线必然直穿, 摆车至少离胶带 30cm。 */
 #define TRANS_PROTECT_MS  1000   /* 段切换保护窗: 窗内禁再切+弧内丢线强拐生效期 */
 #define ARC_SEARCH_DEG    50.0f  /* 弧内丢线强拐角(CTY ±50): 方向取弧内侧 */
 /* 左右轮安装多为镜像, 整车直行需对其中一轮取反: 这两个符号现场标定。 */
