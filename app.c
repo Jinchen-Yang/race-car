@@ -135,7 +135,11 @@ extern volatile uint32_t g_tick_ms;
 /* --- r21A 盲走航向 PI: 速度环退役后左右电机天然差异直通航向, 纯 P 只能"顶住",
  * 顶的结果是恒定航向残差(≈3~5°, 方向随电机差异/电量走 = "时左时右"的来源)。
  * 积分项把恒定不对称学掉, 残差归零。积分每次进盲走清零, 输出限幅防饱和。 --- */
-#define HEADING_KI        2.0f   /* 待整定: 积分增益 mm/s / (°·s) */
+#define HEADING_KI        0.0f   /* r22: 置 0 停用(=纯P, r20 行为)。r21 启用后用户观察到两轮
+                                  * 转速明显不一致而叫停。注意待厘清: 若观察发生在台架(车不能
+                                  * 转动, 航向误差无法消除, 积分必然顶到饱和=正常伪象)则本项
+                                  * 无辜可复启; 若发生在地面且伴随画弧则真有问题。直线时左时右
+                                  * 的替代药: 串口在线配平旋钮('T/t' 固定占空偏置), 待批准。 */
 #define HEADING_INTEG_LIM 30.0f  /* 积分项输出限幅(mm/s): 上限=可学掉的不对称幅度 */
 
 /* --- r21B 出线原地对正: 正式出线时车头与锁定方向差超门限, 先原地转正再起步
@@ -457,14 +461,18 @@ static int track_blind_turn(void)
      *   等效 turn≈1mm/s, KP=2 时稳态航向误差≈0.5°, 2~4 足够, 过大(>8)恐振荡。 */
     float yaw = imu_get_yaw();
     float e   = wrap180(g_yaw_lock - yaw);
-    /* r21A PI: P 顶瞬态, I 学掉左右电机恒定不对称(纯 P 的稳态残差=时左时右元凶)。
-     * 积分带输出限幅抗饱和; 每次进盲走已清零, 不背上一段的旧账。 */
-    g_head_integ += e * ((float)APP_TRACK_DT_MS / 1000.0f);
-    {
-        float ilim = HEADING_INTEG_LIM / HEADING_KI;
-        g_head_integ = clampf(g_head_integ, -ilim, ilim);
+    int turn;
+    if (HEADING_KI > 0.001f) {
+        /* r21A PI(现默认停用, 见 HEADING_KI 注释): I 学掉左右电机恒定不对称 */
+        g_head_integ += e * ((float)APP_TRACK_DT_MS / 1000.0f);
+        {
+            float ilim = HEADING_INTEG_LIM / HEADING_KI;
+            g_head_integ = clampf(g_head_integ, -ilim, ilim);
+        }
+        turn = (int)(g_heading_kp * e + HEADING_KI * g_head_integ);
+    } else {
+        turn = (int)(g_heading_kp * e);   /* r22: 纯 P, 与 r20 直线行为完全一致 */
     }
-    int turn = (int)(g_heading_kp * e + HEADING_KI * g_head_integ);
     /* r17 硬限幅: 减灾 —— 坏锁定值最多走 R≈21cm 缓弧 */
     if (turn >  HEADING_TURN_LIM) turn =  HEADING_TURN_LIM;
     if (turn < -HEADING_TURN_LIM) turn = -HEADING_TURN_LIM;
