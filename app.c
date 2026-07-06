@@ -62,7 +62,7 @@ extern volatile uint32_t g_tick_ms;
 #define VEL_MEAS_LPF      0.5f   /* 待整定: 测速一阶低通系数(0~1,越小越平滑),抑制编码器抖动(等效参考工程的多点滑窗) */
 
 /* --- r25 SelfTurn 转向环(CTY 架构: 统一吃 DeltaYaw°, 出差速占空) --- */
-#define TRACK_KP          7.5f   /* SelfTurn P: 占空差/°; dy=40° 时差速 120('P/p'±0.5 在线调) */
+#define TRACK_KP          6.0f   /* SelfTurn P: 占空差/°; dy=40° 时差速 120('P/p'±0.5 在线调) */
 #define TRACK_KD          2.0f   /* SelfTurn D: 抑制查表台阶跳变的momentum('D/d'±1 在线调) */
 #define TRACK_OUT_LIM   (400.0f) /* (遗留, 仅供闲置的 g_pid_track 初始化) */
 #define BASE_SPEED        150    /* ⚠r25 语义变更: 巡航"占空"(不再是 mm/s)! ≈300mm/s.
