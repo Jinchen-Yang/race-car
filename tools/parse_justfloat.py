@@ -91,8 +91,13 @@ def main():
 
     # —— 复盘速览：跑完先看这几行，再决定把 CSV 丢给谁 ——
     col = {n: j for j, n in enumerate(names)}
-    dur = len(frames) * 0.02
-    print(f"帧数 {len(frames)}（名义 20ms/帧 ≈ {dur:.1f}s）  垃圾字节 {garbage}  → {out}")
+    # 帧周期 = task_vofa 周期(r31=20ms, r32 起=50ms)；有 tick_ms 通道时用真实时间轴
+    if "tick_ms" in col:
+        span = (frames[-1][col["tick_ms"]] - frames[0][col["tick_ms"]]) / 1000.0
+        print(f"帧数 {len(frames)}（tick 实测 ≈ {span:.1f}s）  垃圾字节 {garbage}  → {out}")
+    else:
+        print(f"帧数 {len(frames)}（时长=帧数×task_vofa 周期, r31=20ms/r32=50ms → "
+              f"{len(frames)*0.02:.1f} 或 {len(frames)*0.05:.1f}s）  垃圾字节 {garbage}  → {out}")
 
     def delta(name):
         return frames[-1][col[name]] - frames[0][col[name]] if name in col else float("nan")
@@ -106,9 +111,11 @@ def main():
         ticks = [fr[col["tick_ms"]] for fr in frames]
         dts = [b - a for a, b in zip(ticks, ticks[1:]) if 0 < b - a < 1000]
         if dts:
+            nominal = sorted(dts)[len(dts) // 2]          # 名义周期取中位数(20/50ms 自适应)
+            late = sum(1 for d in dts if d > nominal * 1.25)
             worst = sorted(dts)[-5:]
-            late = sum(1 for d in dts if d > 25)
-            print(f"帧间隔: 均值 {sum(dts)/len(dts):.1f}ms  >25ms 的 {late} 次  最差 5 拍 {worst}")
+            print(f"帧间隔: 名义 {nominal:.0f}ms  均值 {sum(dts)/len(dts):.1f}ms  "
+                  f"迟到(>1.25×名义) {late} 次  最差 5 拍 {worst}")
 
 
 if __name__ == "__main__":
