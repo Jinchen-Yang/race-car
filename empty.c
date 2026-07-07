@@ -405,7 +405,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r33: AIM field constants (AB1000/Tx530/Tz500/Gz161.5, pan-zero=0 mid-left mount)] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r34: AIM fixed-pointing mode (pan=stop pulse, tilt ramp to 116; place target at laser dot)] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

@@ -215,10 +215,20 @@ extern volatile uint32_t g_tick_ms;
  * pan+133(B点解算角)→servo133 ✓量程内); 若试转发现方向反, SIGN=-1 且 ZERO=180
  * (pan+133→servo47, 同样量程内)——两种符号都不越界, 现场只需定方向。
  * TILT 轴为机械固定支架(≈26°上仰), 舵机通道空发无害, 常量保持占位。 */
-#define AIM_PAN_ZERO_DEG   0.0f    /* 首猜(中位指左装法); 零点标定微调 */
-#define AIM_TILT_ZERO_DEG  90.0f   /* TILT 机械固定, 不参与 */
-#define AIM_PAN_SIGN      (+1.0f)  /* 待标: 首次试转定向, 反了改 -1 并把 ZERO 改 180 */
-#define AIM_TILT_SIGN     (+1.0f)  /* TILT 机械固定, 不参与 */
+#define AIM_PAN_ZERO_DEG   0.0f    /* (几何方案用)首猜(中位指左装法); 零点标定微调 */
+#define AIM_TILT_ZERO_DEG  90.0f
+#define AIM_PAN_SIGN      (+1.0f)  /* (几何方案用)待标 */
+#define AIM_TILT_SIGN     (+1.0f)
+
+/* ===== r34 定点打靶·物理简化方案(用户拍板: 靶摆到光点处, 只做停车定点打靶) =====
+ * 背景: 实装=水平360°连续舵机(无位置概念)+垂直180°位置舵机, 而题目说明4要求
+ * 无摄像头完成作业 -> 360做主瞄轴不可行。规则只约束靶在"AB外侧50cm平行线"上,
+ * 沿线位置自由 -> 固定指向, 现场把靶摆到光点落点。AIM_FIXED_MODE 置0可恢复
+ * 几何解算方案(换装位置舵机到水平轴后用)。 */
+#define AIM_FIXED_MODE     1
+#define AIM_TILT_FIX_DEG   116   /* 待标: TILT 指向角(若舵机中位≈水平, 116=26°上仰理论值);
+                                  * 现场按"光点落在靶心高度"微调, 靶面每 1cm ≈ 0.84° */
+#define AIM_TILT_RAMP_DEG  2.0f  /* TILT 斜坡步进(°/10ms拍): ~0.13s 到位, 防满速甩头 */
 
 /* ===== 运行模式(F4: 按键/串口选模式; IDLE 态 MODE 键循环或串口发'1'~'4', RUN 灯闪"模式号"次) =====
  * 1 = F1 自动巡迹一圈回 A 停车(≤30s)
@@ -602,7 +612,7 @@ void track_loop_step(void)
  *           AIM_PAN/TILT_ZERO_DEG、AIM_PAN/TILT_SIGN
  *           均在头部常量组标 "待整定/待标", 场地量了+首次通电试转后回填。
  */
-static void aim_geometry(float *pan_deg, float *tilt_deg)
+__attribute__((unused)) static void aim_geometry(float *pan_deg, float *tilt_deg)
 {
     /* 1) 车头朝向(世界系, 弧度): 当前IMU航向减出发航向, wrap 到 (-180,180] 防跨界 */
     float theta_deg = wrap180(imu_get_yaw() - g_lap_yaw0);
@@ -651,7 +661,7 @@ static void aim_geometry(float *pan_deg, float *tilt_deg)
  * @note  无视觉独立性: 拔摄像头或 found=0 时本函数原样返回 0, 不破坏几何指向。
  *        ⚠ AIM_K_PAN/TILT 与 dx/dy 符号待标(test_plan §D, 与视觉 lane 对齐)。
  */
-static int aim_refine_k230(float *pan_deg, float *tilt_deg)
+__attribute__((unused)) static int aim_refine_k230(float *pan_deg, float *tilt_deg)
 {
     int16_t dx, dy;
 
@@ -677,12 +687,35 @@ static int aim_refine_k230(float *pan_deg, float *tilt_deg)
  */
 static int aim_step_once(void)
 {
+#if AIM_FIXED_MODE
+    /* r34 物理简化方案(用户拍板 2026-07-07): 现有硬件=水平360连续舵机(无位置概念,
+     * 题目说明4又禁视觉主导作业) -> 放弃解算指向, 改"固定指向 + 把靶摆到光点处"
+     * (规则只约束靶在AB外侧50cm平行线上, 沿线位置自由, 摆好后比赛期间不动)。
+     * PAN 恒发 90 = 360舵机停转脉冲(1.5ms; ⚠仍建议扎带把转头物理锁死防蠕转);
+     * TILT(180位置舵机)从中位斜坡抬到定角 = 可见的"自动调整云台姿态+指向"动作,
+     * 满足 F2 文本。恒返回0让 AIM 保持满5秒(激光在靶上亮足, 录像清晰), 超时收尾。 */
+    static float s_tilt_cur = 90.0f;
+    if (g_aim_timer == 0u) {
+        s_tilt_cur = 90.0f;                    /* 入态第一拍: 从中位重新起坡 */
+    }
+    if (s_tilt_cur < (float)AIM_TILT_FIX_DEG) {
+        s_tilt_cur += AIM_TILT_RAMP_DEG;
+        if (s_tilt_cur > (float)AIM_TILT_FIX_DEG) s_tilt_cur = (float)AIM_TILT_FIX_DEG;
+    } else if (s_tilt_cur > (float)AIM_TILT_FIX_DEG) {
+        s_tilt_cur -= AIM_TILT_RAMP_DEG;
+        if (s_tilt_cur < (float)AIM_TILT_FIX_DEG) s_tilt_cur = (float)AIM_TILT_FIX_DEG;
+    }
+    servo_set_angle(SERVO_PAN,  90);           /* 360舵机: 停转脉冲 */
+    servo_set_angle(SERVO_TILT, (int)s_tilt_cur);
+    return 0;                                  /* 不提前退出, 满5s展示 */
+#else
     float pan, tilt;
     aim_geometry(&pan, &tilt);                 /* 1) 无视觉几何指向(主) */
     int hit = aim_refine_k230(&pan, &tilt);    /* 2) K230 精修(辅, 自动回退) */
     servo_set_angle(SERVO_PAN,  (int)pan);
     servo_set_angle(SERVO_TILT, (int)tilt);
     return hit;
+#endif
 }
 
 /* ============================================================================
