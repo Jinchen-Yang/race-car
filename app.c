@@ -196,28 +196,29 @@ extern volatile uint32_t g_tick_ms;
 #define AIM_DEG2RAD(d)    ((d) * (AIM_PI / 180.0f))
 #define AIM_RAD2DEG(r)    ((r) * (180.0f / AIM_PI))
 
-#define AB_LEN_MM         1400.0f  /* 待整定: A→B 直线长度(2024H 同款推测≈1400mm, 与 KP_GATES 一致) */
+#define AB_LEN_MM         1000.0f  /* ✅实测(2026-07-06 场地图): A→B = 100cm */
 #define B_X_MM            AB_LEN_MM /* 车停 B 时的世界 x = AB 长度 */
 #define B_Y_MM            0.0f      /* 车停 B 时的世界 y = 0 (B 在 x 轴上) */
 
-/* 靶位: 题目 PDF 确认"靶距 AB 外侧 50cm, 与 AB 平行", 沿 x 方向落点未硬定 */
-#define TARGET_X_MM       700.0f   /* 待整定: 靶心沿AB方向x坐标(占位=AB中点对面, 场地量) */
-#define TARGET_Y_MM       500.0f   /* PDF 确定: 靶距 AB 外侧 500mm */
-#define TARGET_Z_MM       500.0f   /* 待整定: 靶心离地高度(题目≤500mm, 占位=500) */
+/* 靶位: 规则"靶距 AB 外侧 50cm, 与 AB 平行"; x 落点/高度已卷尺实测 */
+#define TARGET_X_MM       530.0f   /* ✅实测: A 沿 AB 到靶投影点 53cm("大概", ±2cm→±2°, 零点标定可吸收) */
+#define TARGET_Y_MM       500.0f   /* 规则定死: 靶距 AB 外侧 500mm */
+#define TARGET_Z_MM       500.0f   /* ✅实测: 靶心离地 50cm */
 
 /* 云台安装(相对车中心, 车体坐标系): dx 前正、dy 右正、z 离地 */
-#define CAR_GIMBAL_DX_MM   0.0f    /* 待整定: 云台安装前后偏移(前+, 占位=车中心正上) */
-#define CAR_GIMBAL_DY_MM   0.0f    /* 待整定: 云台左右偏移(右+, 占位=车中线) */
-#define CAR_GIMBAL_Z_MM  250.0f    /* 待整定: 云台旋转中心离地高度(车高 250mm, 占位=车顶) */
+#define CAR_GIMBAL_DX_MM   0.0f    /* 按0处理: 厘米级安装偏移折算<2°, 交零点标定吸收 */
+#define CAR_GIMBAL_DY_MM   0.0f    /* 同上 */
+#define CAR_GIMBAL_Z_MM  161.5f    /* ✅实测: PAN舵机水平转轴离地 16.15cm */
 
-/* 舵机零点/符号: 与舵机装配朝向相关, 第一次通电试转标定
- * PAN_ZERO_DEG   = 车头正前方(pan 目标=0°几何角)对应的舵机输入角度
- * TILT_ZERO_DEG  = 云台水平(tilt=0°几何角)对应的舵机输入角度
- * _SIGN 若正是"几何角增大, 舵机角也增大"; 若装反了置 -1 */
-#define AIM_PAN_ZERO_DEG   90.0f
-#define AIM_TILT_ZERO_DEG  90.0f
-#define AIM_PAN_SIGN      (+1.0f)  /* 待标: 第一次目视试转, 反了改 -1 */
-#define AIM_TILT_SIGN     (+1.0f)  /* 待标: 同上 */
+/* 舵机零点/符号: 装配决策(2026-07-06)=舵机中位(90°)时激光指向车正左方(+90°body)。
+ * 由 servo = ZERO + SIGN×pan_body 反推: SIGN=+1 时 ZERO=0(pan+90→servo90 ✓,
+ * pan+133(B点解算角)→servo133 ✓量程内); 若试转发现方向反, SIGN=-1 且 ZERO=180
+ * (pan+133→servo47, 同样量程内)——两种符号都不越界, 现场只需定方向。
+ * TILT 轴为机械固定支架(≈26°上仰), 舵机通道空发无害, 常量保持占位。 */
+#define AIM_PAN_ZERO_DEG   0.0f    /* 首猜(中位指左装法); 零点标定微调 */
+#define AIM_TILT_ZERO_DEG  90.0f   /* TILT 机械固定, 不参与 */
+#define AIM_PAN_SIGN      (+1.0f)  /* 待标: 首次试转定向, 反了改 -1 并把 ZERO 改 180 */
+#define AIM_TILT_SIGN     (+1.0f)  /* TILT 机械固定, 不参与 */
 
 /* ===== 运行模式(F4: 按键/串口选模式; IDLE 态 MODE 键循环或串口发'1'~'4', RUN 灯闪"模式号"次) =====
  * 1 = F1 自动巡迹一圈回 A 停车(≤30s)
