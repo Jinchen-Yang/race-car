@@ -64,6 +64,11 @@ extern volatile uint32_t g_tick_ms;
 /* --- r25 SelfTurn 转向环(CTY 架构: 统一吃 DeltaYaw°, 出差速占空) --- */
 #define TRACK_KP          6.0f   /* SelfTurn P: 占空差/°; dy=40° 时差速 120('P/p'±0.5 在线调) */
 #define TRACK_KD          2.0f   /* SelfTurn D: 抑制查表台阶跳变的momentum('D/d'±1 在线调) */
+#define TRACK_KP_ARC      3.5f   /* r32 增益分家(修移植引入的耦合): 弧线查表专用 KP,
+                                  * 'P/p' 在线调的是它。直线航向保持仍用 TRACK_KP=6.0(定版)。
+                                  * 机理: KP=6 是为直线稳态残差调的, 弧上会把 ±5/15/25/40°
+                                  * 查表台阶放大成 ±30~240 差速 = S 型极限环; CTY 原版直线与
+                                  * 循线本就是两套增益, 移植时并成一个是我们引入的简化。 */
 #define TRACK_OUT_LIM   (400.0f) /* (遗留, 仅供闲置的 g_pid_track 初始化) */
 #define BASE_SPEED        150    /* ⚠r25 语义变更: 巡航"占空"(不再是 mm/s)! ≈300mm/s.
                                   * 'V/v' ±10 在线调, 夹 [60,300] */
@@ -302,8 +307,9 @@ static uint8_t g_kp_idx   = 0;      /**< 关键点序列进度: 0=还没到B ...
 static uint8_t g_lap_count = 0;     /**< 已完成圈数(模式4 四圈连跑用) */
 
 /* --- 在线调参副本(串口实时调, #define 只当默认值; 现场整定免重编译烧录) --- */
-static float g_track_kp   = TRACK_KP;    /**< 循迹外环 KP(运行时可调) */
-static float g_track_kd   = TRACK_KD;    /**< 循迹外环 KD(运行时可调) */
+static float g_track_kp   = TRACK_KP;    /**< 直线航向 KP(定版 6.0, 不在线调) */
+static float g_kp_arc     = TRACK_KP_ARC;/**< r32: 弧线查表 KP('P/p' 在线调) */
+static float g_track_kd   = TRACK_KD;    /**< SelfTurn KD(运行时可调) */
 static int   g_base_speed = BASE_SPEED;  /**< 巡迹基速 mm/s(运行时可调) */
 static float g_heading_kp = HEADING_KP;  /**< 盲走航向锁 KP(串口 'H'/'h' ±0.5, 可为负) */
 static int   g_trim_duty  = DRIVE_TRIM_DUTY_R; /**< r24: 右轮占空配平('T'/'t' ±3, 夹±40) */
@@ -481,14 +487,19 @@ void track_loop_step(void)
     /* 1) 灰度取数: gray_get_error 刷一次 I2C(质心值仅供 ch10 遥测), 原始字节走
      *    diag 通道取。字节语义: bit=0=压线(黑), 0xFF=全白, 0x00=全黑/失联。 */
     (void)gray_get_error();
+    uint8_t fresh = gray_frame_fresh();   /* r32: 本拍 I2C 是否真读到新数据 */
     uint8_t byte = 0xFF;
     gray_get_diag(0, 0, &byte);
 
-    /* 2) CTY 漏积分丢线计数: 空白帧自增(封顶), 有线帧减半 —— 快认线/慢认空 */
-    if (byte == 0xFF || byte == 0x00) {
-        if (g_nodata < 0xFF) g_nodata++;
-    } else if (g_nodata > 0) {
-        g_nodata >>= 1;
+    /* 2) CTY 漏积分丢线计数: 空白帧自增(封顶), 有线帧减半 —— 快认线/慢认空。
+     * r32: I2C 失败帧显式当"无数据"——不推进计数、不喂查表(审计定案: 失败时
+     * 旧字节被冻结, 旧字节含线=朝固定方向拐死, 旧字节全白=段误切/掉头)。 */
+    if (fresh) {
+        if (byte == 0xFF || byte == 0x00) {
+            if (g_nodata < 0xFF) g_nodata++;
+        } else if (g_nodata > 0) {
+            g_nodata >>= 1;
+        }
     }
 
     /* 3) 起步保护: 强制 seg0 + 无视灰度(A 点残端/起步抖动免疫, CTY BeginProtect) */
@@ -523,21 +534,32 @@ void track_loop_step(void)
     /* 6) 统一航向误差 DeltaYaw(°, 左正) —— 本架构唯一的控制接口 */
     float yaw = imu_get_yaw();
     float dy;
+    uint8_t on_ladder = 0;
     if (g_seg == 0u) {
         dy = wrap180(g_datum_yaw - yaw);                /* A→B: 出发基准角 z */
     } else if (g_seg == 2u) {
         dy = wrap180(g_datum_yaw + 180.0f - yaw);       /* C→D: z+180(反向) */
-    } else if (byte != 0xFF && byte != 0x00) {
-        dy = gray_ladder(byte);                         /* 弧上循线: 查表 */
+    } else if (fresh && byte != 0xFF && byte != 0x00) {
+        dy = gray_ladder(byte);                         /* 弧上循线: 查表(仅新鲜帧) */
+        on_ladder = 1;
     } else if (g_protect_ms > 0u) {
         /* 刚进弧就丢线(冲过线头): 保护窗内向弧内侧强拐找线(CTY 手法) */
         dy = LAP_CW ? -ARC_SEARCH_DEG : +ARC_SEARCH_DEG;
     } else {
-        dy = 0.0f;                                      /* 弧上短暂全白: 保持直走 */
+        dy = 0.0f;                                      /* 弧上短暂全白/失败帧: 保持直走 */
     }
 
-    /* 7) SelfTurn PD -> 差速占空('P/p' 调 KP ±0.5, 'D/d' 调 KD ±1) */
-    float diff_f = g_track_kp * dy + g_track_kd * (dy - g_dyaw_prev);
+    /* 7) SelfTurn PD -> 差速占空('P/p' 调弧线KP ±0.5, 'D/d' 调 KD ±1)。
+     * r32 段切换清 D 历史: dy 换源(航向↔查表↔强拐)瞬间差分无意义, 防单拍甩头。 */
+    {
+        static uint8_t s_seg_prev = 0;
+        if (g_seg != s_seg_prev) {
+            s_seg_prev = g_seg;
+            g_dyaw_prev = dy;
+        }
+    }
+    float kp_use = on_ladder ? g_kp_arc : g_track_kp;   /* r32 增益分家 */
+    float diff_f = kp_use * dy + g_track_kd * (dy - g_dyaw_prev);
     g_dyaw_prev = dy;
     int diff = (int)clampf(diff_f, -(float)TURN_DIFF_LIM, (float)TURN_DIFF_LIM);
 
@@ -948,9 +970,8 @@ void app_tune_step(char which, int dir)
      * KP/KD 直接热改 g_pid_track 的增益字段, 下一拍外环立即生效。 */
     float d = (dir >= 0) ? 1.0f : -1.0f;
     if (which == 'p') {
-        g_track_kp += 0.5f * d;                       /* r25: SelfTurn KP(占空差/°) */
-        if (g_track_kp < 0.0f) g_track_kp = 0.0f;
-        g_pid_track.kp = g_track_kp;
+        g_kp_arc += 0.5f * d;                 /* r32: 'P/p' 调弧线查表KP(直线KP定版6.0不动) */
+        if (g_kp_arc < 0.0f) g_kp_arc = 0.0f;
     } else if (which == 'd') {
         g_track_kd += 1.0f * d;                       /* r25: SelfTurn KD */
         if (g_track_kd < 0.0f) g_track_kd = 0.0f;
@@ -979,7 +1000,7 @@ int app_get_trim(void)
 
 void app_tune_get(float *kp, float *kd, int *base, float *hkp)
 {
-    if (kp)   *kp   = g_track_kp;
+    if (kp)   *kp   = g_kp_arc;      /* r32: '?' 的 KP 回显=弧线KP('P/p' 调的那个) */
     if (kd)   *kd   = g_track_kd;
     if (base) *base = g_base_speed;
     if (hkp)  *hkp  = g_heading_kp;

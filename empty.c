@@ -275,7 +275,8 @@ static task_t g_tasks[] = {
     { task_vel,        10,  10, 0 },   /* = APP_VEL_DT_MS */
     { task_track,      20,  20, 0 },   /* = APP_TRACK_DT_MS */
     { task_fsm,        10,  10, 0 },   /* = APP_FSM_DT_MS */
-    { task_vofa,       20,  20, 0 },
+    { task_vofa,       50,  50, 0 },   /* r32: 20→50ms —— 阻塞发送 8.7ms/帧曾吃掉 20ms 拍
+                                        * 44% CPU(审计§3.1, 控制拍抖动源), 降频先还预算 */
 };
 #define N_TASKS ((uint8_t)(sizeof(g_tasks) / sizeof(g_tasks[0])))
 
@@ -404,7 +405,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r31: REVERT r30 thresholds -> r28-proven combo (line-th 8, protect 1.5s); KP=6.0] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r32: anti-snake(ours-only): KP_ARC=3.5 split / D-hist clear on seg / gray fresh gate / VOFA 50ms] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

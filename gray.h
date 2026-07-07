@@ -73,6 +73,13 @@ uint8_t gray_is_lost(void);
 int16_t gray_last_error(void);
 
 /**
+ * @brief 最近一次 gray_get_error 是否真读到数据(r32)
+ * @return 1=本帧有效; 0=I2C 失败, 缓存字节是冻结旧值, 调用方应按"无数据"处理
+ * @note  堵"冻结字节被循迹环消费→拐死/段误切"的缺陷(2026-07-07 审计定案)。
+ */
+uint8_t gray_frame_fresh(void);
+
+/**
  * @brief 读运行时诊断快照: I2C 成功/失败累计计数 + 最近一次原始字节(未解析)
  * @param ok_cnt/fail_cnt/last_byte 输出指针(不需要的传 NULL)
  * @note  纯读零副作用。fail 独涨=电平/接触问题; ok 涨但 last_byte 极性与手册相反

@@ -58,6 +58,8 @@ static uint8_t  s_lost;               /**< 丢线标志: 1=丢线 0=正常 */
 static uint32_t s_ok_cnt;             /**< 累计读取成功次数 */
 static uint32_t s_fail_cnt;           /**< 累计读取失败次数(NACK/超时) */
 static uint8_t  s_last_byte;          /**< 最近一次成功读到的原始字节(未解析) */
+static uint8_t  s_fresh;              /**< r32: 最近一次 gray_get_error 是否真读到数据
+                                       *  (0=I2C失败, s_last_byte 是冻结旧值, 调用方勿消费) */
 
 int gray_init(void)
 {
@@ -114,9 +116,11 @@ int16_t gray_get_error(void)
 {
     /* 1) 刷新一次原始数字量; 读失败则保持丢线、沿用上次偏差(防总线抖动时方向乱跳)。 */
     if (gray_read_raw(s_raw) != 0) {
+        s_fresh = 0;          /* r32: 标记本帧无效, 上层勿消费冻结的 s_last_byte */
         s_lost = 1;
         return s_last_err;
     }
+    s_fresh = 1;
 
     /* 2) 加权质心: 给每路一个「位置权重」(以中线为 0 的对称坐标), 压线路求平均。
      *    8 路对称坐标(放大 2 倍避免分数): 路 i 的坐标 = (2*i - (N-1))。
@@ -154,6 +158,13 @@ int16_t gray_get_error(void)
 uint8_t gray_is_lost(void)
 {
     return s_lost;
+}
+
+uint8_t gray_frame_fresh(void)
+{
+    /* r32: 最近一次 gray_get_error 是否真读到数据。track 环每拍先调 gray_get_error
+     * 再查本标志, 失败帧按"无数据"处理(不喂漏积分/查表), 堵"冻结字节拐死/段误切"。 */
+    return s_fresh;
 }
 
 int16_t gray_last_error(void)
