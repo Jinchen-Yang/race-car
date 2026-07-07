@@ -1,41 +1,79 @@
-## Example Summary
+# race-car — 2026 电赛自动行驶小车(TI MSPM0G3507)
 
-Empty project using DriverLib.
-This example shows a basic empty project using DriverLib with just main file
-and SysConfig initialization.
+北邮 2026 电赛小车赛道题固件:220×120cm 场地、双 R=40cm 半圆弧黑线 + 空白直线段,
+要求自动巡迹一圈(F1 ≤30s)、定点瞄准(F2 ≤5s)、巡迹+对靶联动(F3 ≤40s)、四圈连跑(发挥)。
 
-## Peripherals & Pin Assignments
+**当前状态**:循迹全线已通(单圈 ≈20s,真机验收)·瞄准标定进行中·最新基准 r31。
 
-| Peripheral | Pin | Function |
-| --- | --- | --- |
-| SYSCTL |  |  |
-| DEBUGSS | PA20 | Debug Clock |
-| DEBUGSS | PA19 | Debug Data In Out |
+---
 
-## BoosterPacks, Board Resources & Jumper Settings
+## 1. 硬件
 
-Visit [LP_MSPM0G3507](https://www.ti.com/tool/LP-MSPM0G3507) for LaunchPad information, including user guide and hardware files.
+| 部件 | 型号/说明 | 接口 |
+|---|---|---|
+| 主控 | LP-MSPM0G3507 LaunchPad | — |
+| 电机驱动 | 成品四路板(2×TB6612FNG),Motor A=左 B=右 | PWM: TIMA0 PA8/PB9;方向 PA12/PA13/PB6/PB7;STBY PB0 |
+| 编码器 | MG310 自带 AB 相(左 QEI 4倍频 / 右 GPIO 1倍频) | 左 TIMG8 PA29/PA30;右 PA27/PB24。**r20 起仅作遥测,不参与控制** |
+| 灰度 | 感为 8 路 IIC 版(Rev V3.6),地址 0x4C | I2C1 PB2/PB3 |
+| IMU | MPU6050(GY-521),yaw 左转为正 | I2C0 PA0/PA1 |
+| 云台 | PAN=180°位置舵机(TIMA1 PA17),TILT=机械固定 ≈26° 上仰 | 舵机轨开关 PB23(限制⑥) |
+| 激光 | 装于 PAN 云台,与镜头位同轴向;供电走舵机轨 | — |
+| 视觉(选配) | K230(CanMV),跑 `k230_aim_main.py` | UART2:PB17→K230 RXD,PB16←TXD |
+| 人机 | START=PB19 MODE=PA22 蜂鸣=PB18 RUN灯=PA24 ERR灯=PA26 | 调试串口 UART0(XDS110) |
 
-| Pin | Peripheral | Function | LaunchPad Pin | LaunchPad Settings |
-| --- | --- | --- | --- | --- |
-| PA20 | DEBUGSS | SWCLK | N/A | <ul><li>PA20 is used by SWD during debugging<br><ul><li>`J101 15:16 ON` Connect to XDS-110 SWCLK while debugging<br><li>`J101 15:16 OFF` Disconnect from XDS-110 SWCLK if using pin in application</ul></ul> |
-| PA19 | DEBUGSS | SWDIO | N/A | <ul><li>PA19 is used by SWD during debugging<br><ul><li>`J101 13:14 ON` Connect to XDS-110 SWDIO while debugging<br><li>`J101 13:14 OFF` Disconnect from XDS-110 SWDIO if using pin in application</ul></ul> |
+供电:电机/驱动板走电池 Vin;主控+灰度暂走 USB/充电宝(5V buck 割接待做);舵机轨接驱动板 5V。
 
-### Device Migration Recommendations
-This project was developed for a superset device included in the LP_MSPM0G3507 LaunchPad. Please
-visit the [CCS User's Guide](https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/tools/ccs_ide_guide/doc_guide/doc_guide-srcs/ccs_ide_guide.html#sysconfig-project-migration)
-for information about migrating to other MSPM0 devices.
+## 2. 固件架构(r25 起,CTY 式)
 
-### Low-Power Recommendations
-TI recommends to terminate unused pins by setting the corresponding functions to
-GPIO and configure the pins to output low or input with internal
-pullup/pulldown resistor.
+```
+scheduler(1ms 时基) ── 任务表轮询
+├─ track_loop_step(20ms)  转向核: 一切误差统一折算成 DeltaYaw(°) → PD → 左右差速占空
+│    ├─ 弧线段: 灰度 8 位查表(±5/15/25/40°) + 丢线强拐搜索
+│    ├─ 空白段: 绝对航向保持(段0 目标=z, 段2 目标=z+180; z=START 时车头方向)
+│    └─ 四段状态机: 压线/离线事件驱动(漏积分计数认线), 一圈 4 节点 B/C/D/A
+├─ vel_loop_step(10ms)    r20 起仅编码器测速遥测(速度闭环已弃用)
+├─ app_fsm_step(10ms)     IDLE/RUN/AIM/STOP/ESTOP; 节点声光/模式路由/四圈计圈
+└─ task_vofa / task_cmd   24 通道遥测 + 串口命令台
+```
 
-SysConfig allows developers to easily configure unused pins by selecting **Board**→**Configure Unused Pins**.
+模式(IDLE 下 MODE 键循环或串口发 1~4,RUN 灯每 2s 闪"模式号"次):
+**1**=F1 巡迹一圈停 A · **2**=F2 定点瞄准 · **3**=F3 到 B 停车对靶后续跑 · **4**=四圈连跑(每圈过 A 限幅重锚 ±10° 清陀螺漂移)。
+START 起跑;运动中任意键=急停;ESTOP 下 2s 内三连按 START 软清障。
 
-For more information about jumper configuration to achieve low-power using the
-MSPM0 LaunchPad, please visit the [LP-MSPM0G3507 User's Guide](https://www.ti.com/lit/slau873).
+## 3. 定版参数(真机整定,2026-07-06)
 
-## Example Usage
+| 参数 | 值 | 含义 |
+|---|---|---|
+| TRACK_KP / TRACK_KD | **6.0 / 2.0** | SelfTurn PD(占空差/°) |
+| BASE_SPEED | **150** | 巡航占空(≈300mm/s;r25 起是占空不是 mm/s) |
+| SEG_LINE_TH / SEG_BLANK_TH | 8 / 16 | 认线≈5帧 / 认空白≈16帧(勿轻动:调松到 63 曾致误触发链) |
+| START_PROTECT_MS | 1500 | 起步 1.5s 无视灰度(摆车须离胶带 ≥50cm) |
+| 每圈重锚限幅 | ±10° | 模式 4 专用 |
 
-Compile, load and run the example.
+## 4. 构建/烧录/调试
+
+- **环境**:CCS Theia + MSPM0 SDK 2.10.00.04 + SysConfig 1.26.2 + tiarmclang(工程内 .cproject 已配好,导入即编)
+- **水印制度**:每次烧录后看 boot 串口横幅的 rN 版本号,与预期不符=烧了个寂寞
+- **VOFA+**:JustFloat 引擎,COM=XDS110 口,115200。要点通道:I0 状态机 · I4 DeltaYaw/目标 · I10 灰度质心 · I11 丢线 · I12 航向(左转+) · I15 灰度原始字节(白地=255) · I13/I14 灰度 I2C 成败计数 · I20 当前段目标航向 · I21 转向量 · I23 右轮配平
+- **命令台**(VOFA 发送框,任意状态生效):`1~4` 模式 · `s` 启动 · `x` 急停 · `P/p` KP±0.5 · `D/d` KD±1 · `V/v` 基速±25 · `H/h` 航向KP±0.5 · `T/t` 右轮配平±3 · `?` 回显(注意回显混在二进制流里,优先看波形通道)
+- ⚠ 串口在线调的参数**断电即失**,定版值必须写回 `app.c` 常量再烧
+
+## 5. K230 视觉(选配,拔掉不影响 F1~F3)
+
+`k230_aim_main.py` 跑在 K230(CanMV IDE 调阈值,部署=存板上 main.py):黑阈值找靶心 →
+每帧发 `AA 55 06 05 dxL dxH dyL dyH found CHK 0D`(协议见 `protocol.h`,主控 `k230.c` 解析,
+200ms 无帧自动回退纯几何瞄准)。接线:K230 4pin 口 TXD→PB16、RXD→PB17、共地;K230 开机需 ~10s。
+
+## 6. 待办与已知问题
+
+- [ ] 瞄准标定:场地常量已实测待烧(AB=1000 / 靶投影 530 / 靶心高 500 / 舵机轴高 161.5 mm;解算角 +133° → **云台中位必须装成指左**),零点/符号标定流程待跑
+- [ ] 已知偶发:高速垂直冲线偶尔认不出(≈3 帧 < 认线 5 帧);根治方案=触线降速确认,待实施
+- [ ] 供电割接(5V buck 上车)、F1 录像、模式 4 四圈复测(r29)、F3 干跑
+- 调试全史见 `git log`:每轮改动一条 commit,含现象→机理→修复的完整记录
+
+## 7. 文件导览
+
+`app.c/h` 控制核+状态机(主战场) · `empty.c` 调度/遥测/命令台 · `gray.c` 感为灰度 · `mpu6050.c` IMU ·
+`motor.c` TB6612 · `encoder.c` 编码器 · `servo.c` 云台 · `k230.c` 视觉收帧 · `protocol.h` UART 契约 ·
+`vofa.c` JustFloat · `pid.c` PID · `scheduler.c` 任务表 · `k230_aim_main.py` K230 端脚本 ·
+`固件交接说明.md` / `功能状态清单.md` 交接文档
