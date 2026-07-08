@@ -72,6 +72,14 @@ extern volatile uint32_t g_tick_ms;
 #define TRACK_OUT_LIM   (400.0f) /* (遗留, 仅供闲置的 g_pid_track 初始化) */
 #define BASE_SPEED        150    /* ⚠r25 语义变更: 巡航"占空"(不再是 mm/s)! ≈300mm/s.
                                   * 'V/v' ±10 在线调, 夹 [60,300] */
+/* --- 弧线段灰度->角度偏差换算(连续质心替代离散查表) ---
+ * gray_get_error() 返回加权质心偏差, 范围约 ±350(8路, 权重±7, 放大100倍)。
+ * 需要换算成 DeltaYaw 角度(°)才能与直线段的 IMU 航向偏差统一量纲。
+ * 物理含义: 质心偏差 1 个单位 ≈ 传感器偏移 0.1mm, 在 1m 弧半径上 ≈ 0.006°。
+ * 实际增益取决于传感器安装高度/线宽/弧半径, 现场按"弧上循线稳态偏差小"整定。 */
+#define ARC_ERR_TO_DEG    0.12f  /* 待整定: 质心偏差→角度(°)换算系数, 越大弧上纠偏越猛 */
+#define ARC_ERR_DEG_LIM   45.0f /* 弧线段连续质心偏差限幅(°), 防极端值 */
+
 /* --- r25 段状态机(CTY Task4StateUpdate 移植) --- */
 #define LAP_CW            1      /* 题目正式路线 A→B 先行 = 顺时针圈(两弧皆右转); 反向跑改0 */
 #define TURN_DIFF_LIM     150    /* SelfTurn 差速限幅(占空) */
@@ -200,10 +208,13 @@ extern volatile uint32_t g_tick_ms;
 #define B_X_MM            AB_LEN_MM /* 车停 B 时的世界 x = AB 长度 */
 #define B_Y_MM            0.0f      /* 车停 B 时的世界 y = 0 (B 在 x 轴上) */
 
-/* 靶位: 规则"靶距 AB 外侧 50cm, 与 AB 平行"; x 落点/高度已卷尺实测 */
-#define TARGET_X_MM       530.0f   /* ✅实测: A 沿 AB 到靶投影点 53cm("大概", ±2cm→±2°, 零点标定可吸收) */
-#define TARGET_Y_MM       500.0f   /* 规则定死: 靶距 AB 外侧 500mm */
-#define TARGET_Z_MM       500.0f   /* ✅实测: 靶心离地 50cm */
+/* 靶位: 规则"靶距 AB 外侧 50cm, 与 AB 平行"; 实测值 2026-07-08
+ * 靶在 AB 中垂线上: X = AB/2 = 500mm
+ * 距 AB 线 70cm: Y = 700mm
+ * 靶心高度 30cm: Z = 300mm */
+#define TARGET_X_MM       500.0f   /* AB 中点(A→B 方向 50cm 处) */
+#define TARGET_Y_MM       700.0f   /* 距 AB 线外侧 70cm */
+#define TARGET_Z_MM       300.0f   /* 靶心离地 30cm */
 
 /* 云台安装(相对车中心, 车体坐标系): dx 前正、dy 右正、z 离地 */
 #define CAR_GIMBAL_DX_MM   0.0f    /* 按0处理: 厘米级安装偏移折算<2°, 交零点标定吸收 */
@@ -551,7 +562,12 @@ void track_loop_step(void)
     } else if (g_seg == 2u) {
         dy = wrap180(g_datum_yaw + 180.0f - yaw);       /* C→D: z+180(反向) */
     } else if (fresh && byte != 0xFF && byte != 0x00) {
-        dy = gray_ladder(byte);                         /* 弧上循线: 查表(仅新鲜帧) */
+        /* 弧上循线: 用连续质心值(gray_get_error 已在上方调用)替代离散查表,
+         * 消除 ±5/15/25/40° 台阶跳变 → PD 输出连续平滑 → 车不抖。
+         * 质心范围约 ±350, 乘 ARC_ERR_TO_DEG 换算成等效角度偏差。 */
+        int16_t centroid = gray_last_error();             /* 连续质心(纯读缓存, 无I2C) */
+        dy = (float)centroid * ARC_ERR_TO_DEG;
+        dy = clampf(dy, -ARC_ERR_DEG_LIM, ARC_ERR_DEG_LIM);
         on_ladder = 1;
     } else if (g_protect_ms > 0u) {
         /* 刚进弧就丢线(冲过线头): 保护窗内向弧内侧强拐找线(CTY 手法) */
@@ -918,11 +934,16 @@ void app_fsm_step(void)
         break;
 
     case APP_ST_ESTOP:
-        /* 急停安全态: 持续保持电机停 + 舵机轨断电, 直到外部清故障。 */
+        /* 急停安全态: 持续保持电机停 + 舵机轨断电, 直到外部清故障。
+         * r35: 红灯慢闪(500ms亮/500ms灭)而非常亮, 与"开机初始化"和"传感器故障"
+         * 的常亮区分, 明确提示用户"需要连按3次START清障"。 */
         motor_stop_all();
         servo_rail_enable(0);
-        led_err_set(1);
-        /* TODO: 清故障条件满足后 -> led_err_set(0); g_state = APP_ST_IDLE。 */
+        {
+            static uint16_t s_estop_blink = 0;
+            s_estop_blink = (uint16_t)((s_estop_blink + APP_FSM_DT_MS) % 1000u);
+            led_err_set(s_estop_blink < 500u ? 1 : 0);
+        }
         break;
 
     default:

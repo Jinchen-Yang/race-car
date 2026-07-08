@@ -27,14 +27,22 @@
  * 否则脉宽换算会整体偏。若改 SysConfig 周期，这里同步改。 */
 #define SERVO_PERIOD_US     20000u   /* 待整定: PWM 周期(us), 须与 SysConfig PWM_SERVO 周期一致 */
 
-/* 角度->脉宽端点（占位，对应 0° 与 180°）。MG996R 名义 0.5~2.5ms，
- * 但各舵机端点有差异，装好后用 servo_set_angle 扫到两端实测机械极限再回填。 */
-#define SERVO_PULSE_MIN_US  500u     /* 待整定: 对应 SERVO_DEG_MIN 的脉宽(us), 占位 0.5ms */
-#define SERVO_PULSE_MAX_US  2500u    /* 待整定: 对应 SERVO_DEG_MAX 的脉宽(us), 占位 2.5ms */
+/* ===== PAN 舵机（360° 连续旋转，速度控制） =====
+ * 脉宽 1000-2000µs：1500µs=停转，1500-2000µs=逆时针（正转），1000-1500µs=顺时针（反转）。
+ * 死区 1400-1600µs（速度≈0）。本驱动只用"停转"语义（发 90°→1500µs），
+ * 不做连续旋转调速——F2 瞄准时 PAN 方向由物理安装决定。 */
+#define SERVO_PAN_PULSE_MIN_US  1000u   /* PAN 最小脉宽(us) = 全速顺时针 */
+#define SERVO_PAN_PULSE_MAX_US  2000u   /* PAN 最大脉宽(us) = 全速逆时针 */
+#define SERVO_PAN_STOP_US       1500u   /* PAN 停转脉宽(us) = 速度为0 */
+#define SERVO_PAN_DEG_MIN       0       /* PAN 角度映射范围（仅用于 API 兼容，实际是速度控制） */
+#define SERVO_PAN_DEG_MAX       180     /* PAN 90°=停转，0/180=全速正/反转 */
 
-/* 角度限位（占位）。先给满量程 0~180，标定后按云台机械行程收窄，防舵机/结构互顶堵转。 */
-#define SERVO_DEG_MIN       0        /* 待整定: 允许最小角度(度), 占位 0 */
-#define SERVO_DEG_MAX       180      /* 待整定: 允许最大角度(度), 占位 180 */
+/* ===== TILT 舵机（180° 位置舵机） =====
+ * 脉宽 500-2500µs 对应 0-180°。待标定：装好后扫两端实测机械极限再回填。 */
+#define SERVO_TILT_PULSE_MIN_US  500u   /* 待整定: 对应 0° 的脉宽(us) */
+#define SERVO_TILT_PULSE_MAX_US  2500u  /* 待整定: 对应 180° 的脉宽(us) */
+#define SERVO_TILT_DEG_MIN       0      /* 待整定: 允许最小角度(度) */
+#define SERVO_TILT_DEG_MAX       180    /* 待整定: 允许最大角度(度) */
 
 /* 初始化安全中位角（占位）。两路上电先给中位，避免后续上电源轨时大幅扫动。 */
 #define SERVO_INIT_DEG      90       /* 待整定: 初始中位角(度), 占位 90 */
@@ -56,14 +64,23 @@ static uint32_t pulse_to_ccr(uint32_t pulse_us)
     return load - high;                                       /* 反比: 高电平越多 CCR 越小 */
 }
 
-/* 把角度(已限位)线性映射到脉宽(us)：deg=MIN->PULSE_MIN, deg=MAX->PULSE_MAX。 */
-static uint32_t deg_to_pulse_us(int deg)
+/* 把角度按通道映射到脉宽(us)。
+ * PAN(360°连续): 0-180 线性映射到 1000-2000µs, 90°=1500µs=停转。
+ * TILT(180°位置): 0-180 线性映射到 500-2500µs。 */
+static uint32_t deg_to_pulse_us(int ch, int deg)
 {
-    /* 线性插值: pulse = MIN + (deg-DEG_MIN)*(MAX-MIN)/(DEG_MAX-DEG_MIN) */
-    int span_deg   = SERVO_DEG_MAX - SERVO_DEG_MIN;          /* 角度跨度, 占位 180 */
-    uint32_t span_us = SERVO_PULSE_MAX_US - SERVO_PULSE_MIN_US; /* 脉宽跨度, 占位 2000us */
-    uint32_t off   = (uint32_t)(deg - SERVO_DEG_MIN) * span_us / (uint32_t)span_deg;
-    return SERVO_PULSE_MIN_US + off;
+    if (ch == SERVO_PAN) {
+        /* PAN: 0°=1000µs(全速顺时针), 90°=1500µs(停转), 180°=2000µs(全速逆时针) */
+        uint32_t span_us = SERVO_PAN_PULSE_MAX_US - SERVO_PAN_PULSE_MIN_US; /* 1000µs */
+        uint32_t off = (uint32_t)deg * span_us / (uint32_t)(SERVO_PAN_DEG_MAX - SERVO_PAN_DEG_MIN);
+        return SERVO_PAN_PULSE_MIN_US + off;
+    } else {
+        /* TILT: 0°=500µs, 180°=2500µs */
+        uint32_t span_us = SERVO_TILT_PULSE_MAX_US - SERVO_TILT_PULSE_MIN_US; /* 2000µs */
+        uint32_t off = (uint32_t)(deg - SERVO_TILT_DEG_MIN) * span_us
+                       / (uint32_t)(SERVO_TILT_DEG_MAX - SERVO_TILT_DEG_MIN);
+        return SERVO_TILT_PULSE_MIN_US + off;
+    }
 }
 
 void servo_init(void)
@@ -83,10 +100,16 @@ void servo_set_angle(int ch, int deg)
 {
     if (ch != SERVO_PAN && ch != SERVO_TILT) return;   /* 非法通道直接忽略, 防越界写 */
 
-    if (deg < SERVO_DEG_MIN) deg = SERVO_DEG_MIN;      /* 软件限位: 夹紧到允许角度范围 */
-    if (deg > SERVO_DEG_MAX) deg = SERVO_DEG_MAX;      /* 防舵机/结构互顶堵转 */
+    /* 按通道限位 */
+    if (ch == SERVO_PAN) {
+        if (deg < SERVO_PAN_DEG_MIN) deg = SERVO_PAN_DEG_MIN;
+        if (deg > SERVO_PAN_DEG_MAX) deg = SERVO_PAN_DEG_MAX;
+    } else {
+        if (deg < SERVO_TILT_DEG_MIN) deg = SERVO_TILT_DEG_MIN;
+        if (deg > SERVO_TILT_DEG_MAX) deg = SERVO_TILT_DEG_MAX;
+    }
 
-    uint32_t pulse_us = deg_to_pulse_us(deg);          /* 角度 -> 脉宽(us) */
+    uint32_t pulse_us = deg_to_pulse_us(ch, deg);      /* 角度 -> 脉宽(us), 按通道映射 */
     uint32_t ccr      = pulse_to_ccr(pulse_us);        /* 脉宽 -> CCR(与占空成反比) */
 
     /* ch=PAN -> CCP0 通道, ch=TILT -> CCP1 通道（写入对应 CC 寄存器索引） */

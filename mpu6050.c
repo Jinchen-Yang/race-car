@@ -17,6 +17,7 @@
  */
 #include "mpu6050.h"
 #include "bsp_i2c.h"   /* I2C 收口: i2c_write_reg / i2c_read_reg(返回值式) / i2c_read_regs */
+#include "encoder.h"    /* 互补滤波: enc_get_count 读轮计数推算差速航向变化率 */
 
 /* empty.c 的 1ms 全局时基(SysTick 里自增), imu_update 用它算真实积分 dt */
 extern volatile uint32_t g_tick_ms;
@@ -83,6 +84,18 @@ extern volatile uint32_t g_tick_ms;
  * 2026-07-04 验收后启用: 静止漂移可见(校准残余零漂), 0.3°/s 死区压掉它;
  * 循迹转弯角速度 ≥20°/s 远高于死区, 不受影响。若发现慢弯航向跟不上再调小。 */
 #define IMU_GYRO_DEADBAND_DPS   0.3f    /* 待整定: 角速度死区(°/s) */
+
+/* ===== 互补滤波: 陀螺(短时精确) + 编码器差速(无长期漂移) =====
+ * 纯陀螺积分的致命缺陷: 零漂累积, 跑 15s 一圈漂 ≈7.5°。
+ * 编码器差速 yaw_rate = (vR-vL)/track 无累积误差, 但单帧噪声大(尤其右轮单相 254cnt/rev)。
+ * 互补滤波: fused = alpha*gyro + (1-alpha)*encoder, alpha 大=重陀螺(抗噪)轻编码器(修漂移)。
+ * 0.98 意味着 98% 信任陀螺瞬时值, 2% 信任编码器——编码器只负责"慢慢把陀螺漂移拉回来"。 */
+#define IMU_FUSION_ALPHA        0.98f   /* 待整定: 互补系数, 越大越重陀螺(抗噪), 越小越重编码器(修漂移快) */
+#define IMU_WHEEL_TRACK_MM      140.0f  /* 待实测: 左右轮距(mm), 估值! 增益∝轮距, 实测方法见注释 */
+                                        /* 实测法: 让车原地转 N 圈(如3圈), 读 IMU 累计转角 Δyaw_enc,
+                                         * 同时读右轮里程 Δs, 则 track = Δs*360 / (Δyaw_enc * π) */
+#define IMU_ENC_MM_PER_CNT_L    (3.1415926f * 47.0f / ENC_L_CNT_PER_REV)  /* 左轮 mm/计数, 与 app.c 一致 */
+#define IMU_ENC_MM_PER_CNT_R    (3.1415926f * 47.0f / ENC_R_CNT_PER_REV)  /* 右轮 mm/计数 */
 
 /* ===================== 模块内部状态 ===================== */
 static float s_yaw_deg     = 0.0f;  /**< 累计航向角(度)，imu_get_yaw 积分结果，imu_reset_yaw 清零 */
@@ -250,13 +263,58 @@ void imu_update(void)
         dt_ms = IMU_DT_MS;   /* 首拍/断点长暂停兜底 */
     }
 
-    /* 去零漂 -> 转成 °/s（除以灵敏度）。当前为纯陀螺积分，长期必漂，见文件末尾改进说明。 */
+    /* 去零漂 -> 转成 °/s（除以灵敏度） */
     float gz_dps = ((float)r.gyro_z - s_gyro_z_bias) / IMU_GYRO_LSB_PER_DPS;
 
     /* 死区：极小角速度视为静止不积分，进一步压零漂（IMU_GYRO_DEADBAND_DPS=0 时不生效） */
     float gz_abs = (gz_dps < 0.0f) ? -gz_dps : gz_dps;   /* |角速度| */
-    if (gz_abs >= IMU_GYRO_DEADBAND_DPS) {
-        s_yaw_deg += gz_dps * ((float)dt_ms / 1000.0f);
+    if (gz_abs < IMU_GYRO_DEADBAND_DPS) {
+        gz_dps = 0.0f;   /* 死区内归零, 不积分(但仍参与融合, 只是贡献为0) */
+    }
+
+    /* ===== 互补滤波: 陀螺 + 编码器差速 =====
+     * 编码器差速推算 yaw 变化率: yaw_rate_enc = (vR - vL) / track * (180/π)
+     *   vR, vL = 左右轮瞬时速度(mm/s) = delta_cnt * mm_per_cnt / dt
+     *   track  = 左右轮距(mm)
+     * 互补: fused_rate = alpha * gyro_rate + (1-alpha) * enc_rate
+     *   alpha=0.98: 98% 陀螺(抗高频噪声), 2% 编码器(慢慢修正陀螺漂移)
+     * 首拍(dt_ms 兜底)或编码器异常时退化为纯陀螺。 */
+    {
+        static int32_t s_encL_prev = 0, s_encR_prev = 0;
+        static uint8_t s_fusion_init = 0;
+
+        int32_t encL = enc_get_count(ENC_LEFT);
+        int32_t encR = enc_get_count(ENC_RIGHT);
+
+        if (!s_fusion_init) {
+            /* 首拍: 只存基准, 不融合(编码器差值无意义) */
+            s_encL_prev = encL;
+            s_encR_prev = encR;
+            s_fusion_init = 1;
+            s_yaw_deg += gz_dps * ((float)dt_ms / 1000.0f);
+        } else {
+            int32_t dL = encL - s_encL_prev;
+            int32_t dR = encR - s_encR_prev;
+            s_encL_prev = encL;
+            s_encR_prev = encR;
+
+            /* 左右轮行进距离(mm) */
+            float distL = (float)dL * IMU_ENC_MM_PER_CNT_L;
+            float distR = (float)dR * IMU_ENC_MM_PER_CNT_R;
+
+            /* 差速推算 yaw 变化率(°/s): Δyaw = (distR-distL)/track * 180/π, rate = Δyaw/dt */
+            float dt_s = (float)dt_ms / 1000.0f;
+            float enc_yaw_rate = 0.0f;
+            if (IMU_WHEEL_TRACK_MM > 1.0f && dt_s > 0.001f) {
+                float dyaw_deg = (distR - distL) / IMU_WHEEL_TRACK_MM * (180.0f / 3.1415926f);
+                enc_yaw_rate = dyaw_deg / dt_s;
+            }
+
+            /* 互补融合 */
+            float fused_rate = IMU_FUSION_ALPHA * gz_dps
+                             + (1.0f - IMU_FUSION_ALPHA) * enc_yaw_rate;
+            s_yaw_deg += fused_rate * dt_s;
+        }
     }
 }
 

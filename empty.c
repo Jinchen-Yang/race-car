@@ -350,17 +350,24 @@ int main(void)
         led_err_set(1);
         uart_puts("[ERR] MPU6050 init failed: check wiring / 3.3V pullup / AD0\r\n");
     } else {
-        /* 开机静止零漂校准(阻塞约 1 秒, 期间双灯同亮作指示; 上电时车天然静止)。
-         * F1 整圈判定与丢线盲走都吃航向精度, 未校准的零漂 30s 能漂出好几度。 */
+        /* 开机静止零漂校准(阻塞约 1 秒; 上电时车天然静止)。
+         * F1 整圈判定与丢线盲走都吃航向精度, 未校准的零漂 30s 能漂出好几度。
+         * r35: 只亮 RUN 灯(表示"正在初始化"), 不亮红灯(避免用户误解为故障)。 */
         led_run_set(1);
-        led_err_set(1);
-        uart_puts("IMU gyro calibrating, keep car still...\r\n");
+        led_err_set(0);
+        uart_puts("IMU gyro calibrating, keep car still... (press START to skip)\r\n");
         /* 校准 + 2 秒漂移自检, 不合格自动重校(最多 3 轮)。
          * 背景(2026-07-05): 航向锁正负符号都打转, 头号嫌疑=某些开机校准未生效导致 yaw
          * 匀速漂移, 航向环追着漂移参考跑必发散。此自检让每次开机自带体检报告:
          * [DIAG] yaw drift 行 <100(即 <1°/2s)才放行。典型 boot 增时 ~2s, 最坏 ~9s。 */
         int cal_ok = 0;
         for (int attempt = 1; attempt <= 3 && !cal_ok; attempt++) {
+            /* r35: 校准期间扫描 START 键, 用户可按跳过(直接用未校准的零偏进 IDLE) */
+            key_scan();
+            if (key_pressed(KEY_START)) {
+                uart_puts("[USER] calibration skipped by START key\r\n");
+                break;
+            }
             if (imu_gyro_calibrate() != 0) {
                 uint32_t cal_good;
                 imu_get_diag(0, 0, &cal_good);
