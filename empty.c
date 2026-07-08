@@ -86,6 +86,23 @@ static void uart_print_u32(uint32_t v)
     uart_puts(&b[i]);
 }
 
+static void uart_print_i32(int32_t v)
+{
+    if (v < 0) {
+        uint32_t mag = (uint32_t)(-(v + 1)) + 1u;
+        uart_puts("-");
+        uart_print_u32(mag);
+    } else {
+        uart_print_u32((uint32_t)v);
+    }
+}
+
+/* Serial Studio Quick Plot 临时模式:
+ * 1 = 串口输出纯数字 CSV 文本, 方便直接看灰度/I2C 接线稳定性;
+ * 0 = 原 VOFA JustFloat 二进制 24 通道输出。 */
+#define SERIAL_STUDIO_CSV 1
+#define CMD_TEXT_ECHO     (!SERIAL_STUDIO_CSV)
+
 /* —— 调度任务 —— */
 
 /* 心跳灯: 每 500ms 翻一次 -> 1Hz 慢闪(活着的最直观证据, 死机/卡死一眼可见) */
@@ -115,30 +132,136 @@ static void task_key(void)
 /* 串口命令台(F4 "串口设定运行模式与参数"): 复用 UART0(VOFA 那条线)的接收方向,
  * 在 VOFA 的发送框里敲单字符命令即可(结尾的\r\n会被忽略)。
  *   '1'~'4' = 设模式(仅待机) | 's' = 启动(仅待机) | 'x' = 急停(任何时候)
- *   'P'/'p' = 循迹 KP 增/减  | 'D'/'d' = KD 增/减 | 'V'/'v' = 基速增/减
- *   'H'/'h' = 盲走航向锁 KP 增/减(±0.5, 可负) | 'T'/'t' = 右轮配平 ±3(车右偏按T左偏按t)
- *   '?' = 报状态
+ *   'r' = STOP 回 IDLE; ESTOP 下 2s 内连发 3 次清障 | '?' = 报状态/命令帮助
+ *   'P'/'p' = 弯道 KP 增/减 | 'D'/'d' = KD 增/减 | 'A'/'a' = 灰度比例增/减
+ *   'V'/'v' = 基速增/减 | 'H'/'h' = 直线航向锁 KP 增/减 | 'T'/'t' = 右轮配平 ±3
+ *   'G'/'g' = 灰度认线最小黑点数增/减(抗阴影, 默认2)
+ *   'O'/'o' = 舵机轨上/下电 | 'C' = 云台中位 | 'J'/'j' = PAN±1° | 'K'/'k' = TILT±5°
+ *   'Y'/'y' = 水平 360° 连续舵机停转脉宽 ±5us(消蠕转)
  * UART0 未开 RX 中断: 靠 10ms 轮询 + 硬件 RX FIFO 缓冲, 手敲命令绰绰有余。 */
+static void cmd_print_help(void)
+{
+#if CMD_TEXT_ECHO
+    uart_puts("[CMD] 1-4 mode, s start, x estop, r reset/ack, ? status/help\r\n");
+    uart_puts("[PID] P/p arcKP +/-0.5, D/d KD +/-1, A/a arcScale +/-0.01, V/v speed +/-10, H/h lineKP +/-0.5, T/t trim +/-3, G/g grayMinHits +/-1\r\n");
+    uart_puts("[SERVO] O/o rail on/off, C center, J/j PAN +/-1deg, K/k TILT +/-5deg, Y/y contStop +/-5us\r\n");
+#endif
+}
+
+static int cmd_servo_allowed(void)
+{
+    app_state_e st = app_get_state();
+    return (st == APP_ST_IDLE || st == APP_ST_STOP);
+}
+
+static void cmd_print_servo_inline(void)
+{
+#if CMD_TEXT_ECHO
+    uart_puts(" SERVO=");
+    uart_puts(servo_rail_is_enabled() ? "ON" : "OFF");
+    uart_puts(" PAN=");
+    uart_print_i32(servo_get_angle(SERVO_PAN));
+    uart_puts("/");
+    uart_print_u32(servo_get_pulse_us(SERVO_PAN));
+    uart_puts("us TILT=");
+    uart_print_i32(servo_get_angle(SERVO_TILT));
+    uart_puts("/");
+    uart_print_u32(servo_get_pulse_us(SERVO_TILT));
+    uart_puts("us ContStop=");
+    uart_print_u32(app_get_aim_stop_us());
+    uart_puts("us");
+#endif
+}
+
+static void cmd_servo_blocked(void)
+{
+#if CMD_TEXT_ECHO
+    uart_puts("[CMD] servo blocked: use IDLE/STOP (x for ESTOP, o for rail off)\r\n");
+#endif
+}
+
+static void cmd_servo_status_line(void)
+{
+#if CMD_TEXT_ECHO
+    uart_puts("[CMD]");
+    cmd_print_servo_inline();
+    uart_puts("\r\n");
+#endif
+}
+
+static void cmd_servo_step(int ch, int delta_deg)
+{
+    if (!cmd_servo_allowed()) {
+        cmd_servo_blocked();
+        return;
+    }
+    servo_set_angle(ch, servo_get_angle(ch) + delta_deg);
+    cmd_servo_status_line();
+}
+
 static void cmd_print_status(void)
 {
+#if CMD_TEXT_ECHO
     float kp, kd, hkp; int base;
     app_tune_get(&kp, &kd, &base, &hkp);
     uart_puts("[CMD] st=");   uart_print_u32((uint32_t)app_get_state());
     uart_puts(" md=");        uart_print_u32((uint32_t)app_get_mode());
-    uart_puts(" KPx100=");    uart_print_u32((uint32_t)(kp * 100.0f + 0.5f));
+    uart_puts(" ArcKPx100="); uart_print_u32((uint32_t)(kp * 100.0f + 0.5f));
     uart_puts(" KDx100=");    uart_print_u32((uint32_t)(kd * 100.0f + 0.5f));
+    uart_puts(" ArcScaleX1000=");
+    uart_print_u32((uint32_t)(app_tune_get_arc_scale() * 1000.0f + 0.5f));
     uart_puts(" V=");         uart_print_u32((uint32_t)base);
-    uart_puts(" HKPx100=");   /* 航向锁 KP 可为负, 手工打符号(uart_print_u32 只认无符号) */
-    if (hkp < 0.0f) { uart_puts("-"); uart_print_u32((uint32_t)(-hkp * 100.0f + 0.5f)); }
-    else            {                 uart_print_u32((uint32_t)( hkp * 100.0f + 0.5f)); }
+    uart_puts(" LineKPx100=");
+    uart_print_i32((int32_t)(hkp * 100.0f + (hkp >= 0.0f ? 0.5f : -0.5f)));
     {
         int trim = app_get_trim();
+        uint8_t raw = 0xFF;
+        uint8_t hits, line_ok, min_hits;
+        gray_get_diag(0, 0, &raw);
+        app_eval_gray_gate(raw, gray_frame_fresh(), &hits, &line_ok, &min_hits);
         uart_puts(" TRIM=");
-        if (trim < 0) { uart_puts("-"); uart_print_u32((uint32_t)(-trim)); }
-        else          {                 uart_print_u32((uint32_t)( trim)); }
+        uart_print_i32((int32_t)trim);
+        uart_puts(" GrayHits=");
+        uart_print_u32((uint32_t)hits);
+        uart_puts(" LineOK=");
+        uart_print_u32((uint32_t)line_ok);
+        uart_puts(" GrayMin=");
+        uart_print_u32((uint32_t)min_hits);
+        cmd_print_servo_inline();
     }
     uart_puts("\r\n");
+#endif
 }
+
+static void cmd_recover(void)
+{
+    app_state_e st = app_get_state();
+    if (st == APP_ST_STOP) {
+        app_return_idle();
+#if CMD_TEXT_ECHO
+        uart_puts("[CMD] STOP->IDLE\r\n");
+#endif
+    } else if (st == APP_ST_ESTOP) {
+        app_estop_ack();
+#if CMD_TEXT_ECHO
+        if (app_get_state() == APP_ST_IDLE) {
+            uart_puts("[CMD] ESTOP cleared -> IDLE\r\n");
+        } else {
+            uart_puts("[CMD] ESTOP ack: send r 3 times within 2s\r\n");
+        }
+#endif
+    } else if (st == APP_ST_IDLE) {
+#if CMD_TEXT_ECHO
+        uart_puts("[CMD] already IDLE\r\n");
+#endif
+    } else {
+#if CMD_TEXT_ECHO
+        uart_puts("[CMD] r ignored while running; send x for ESTOP\r\n");
+#endif
+    }
+    cmd_print_status();
+}
+
 static void task_cmd(void)
 {
     while (!DL_UART_isRXFIFOEmpty(UART_VOFA_INST)) {
@@ -149,23 +272,70 @@ static void task_cmd(void)
             cmd_print_status();
             break;
         case 's':
+#if CMD_TEXT_ECHO
             if (app_get_state() == APP_ST_IDLE) { app_start_request(); uart_puts("[CMD] start\r\n"); }
+#else
+            if (app_get_state() == APP_ST_IDLE) { app_start_request(); }
+#endif
             break;
         case 'x':
             app_estop();
+#if CMD_TEXT_ECHO
             uart_puts("[CMD] ESTOP\r\n");
+#endif
+            break;
+        case 'r':
+            cmd_recover();
             break;
         case 'P': app_tune_step('p', +1); cmd_print_status(); break;
         case 'p': app_tune_step('p', -1); cmd_print_status(); break;
         case 'D': app_tune_step('d', +1); cmd_print_status(); break;
         case 'd': app_tune_step('d', -1); cmd_print_status(); break;
+        case 'A': app_tune_step('a', +1); cmd_print_status(); break;
+        case 'a': app_tune_step('a', -1); cmd_print_status(); break;
         case 'V': app_tune_step('v', +1); cmd_print_status(); break;
         case 'v': app_tune_step('v', -1); cmd_print_status(); break;
         case 'H': app_tune_step('h', +1); cmd_print_status(); break;
         case 'h': app_tune_step('h', -1); cmd_print_status(); break;
         case 'T': app_tune_step('t', +1); cmd_print_status(); break;
         case 't': app_tune_step('t', -1); cmd_print_status(); break;
-        case '?': cmd_print_status(); break;
+        case 'G': app_tune_step('g', +1); cmd_print_status(); break;
+        case 'g': app_tune_step('g', -1); cmd_print_status(); break;
+        case 'O':
+            if (cmd_servo_allowed()) {
+                servo_rail_enable(1);
+                cmd_servo_status_line();
+            } else {
+                cmd_servo_blocked();
+            }
+            break;
+        case 'o':
+            servo_rail_enable(0);
+            cmd_servo_status_line();
+            break;
+        case 'C':
+            if (cmd_servo_allowed()) {
+                servo_set_angle(SERVO_PAN, 90);
+                servo_set_angle(SERVO_TILT, 90);
+                cmd_servo_status_line();
+            } else {
+                cmd_servo_blocked();
+            }
+            break;
+        case 'J': cmd_servo_step(SERVO_PAN,  +1); break;
+        case 'j': cmd_servo_step(SERVO_PAN,  -1); break;
+        case 'K': cmd_servo_step(SERVO_TILT, +5); break;
+        case 'k': cmd_servo_step(SERVO_TILT, -5); break;
+        case 'Y':
+        case 'y':
+            if (cmd_servo_allowed()) {
+                app_aim_stop_trim(c == 'Y' ? +1 : -1);
+                cmd_servo_status_line();
+            } else {
+                cmd_servo_blocked();
+            }
+            break;
+        case '?': cmd_print_status(); cmd_print_help(); break;
         default:  break;   /* \r \n 及未知字符: 静默忽略 */
         }
     }
@@ -209,26 +379,90 @@ static void task_fsm(void)
     app_fsm_step();
 }
 
-/* VOFA 调试波形: 只发"纯只读"量。
+/* 调试波形: 只发"纯只读"量。
  * ⚠ 副作用规则: gray_get_error() 会做 I2C 读并搅动丢线状态, 只在 IDLE 代刷(见下);
  *   imu_get_yaw() 自 2026-07-04 重构后是纯读缓存(积分收口在 task_imu), 这里随便读;
  *   enc_get_count 是非破坏读(enc_get_delta 才是消费式), 安全。 */
 static void task_vofa(void)
 {
+    /* 灰度偏差通道: RUN 态刷新权归 track 环独有; 其它状态由这里代刷,
+     * 方便台架/STOP/ESTOP 下"挥黑胶带看读数"。 */
+    float gray_err;
+    if (app_get_state() != APP_ST_RUN) {
+        gray_err = (float)gray_get_error();      /* 非 RUN: 代为刷新(含一次 I2C 读) */
+    } else {
+        gray_err = (float)gray_last_error();     /* RUN: 纯读缓存, 零副作用 */
+    }
+    uint32_t g_ok, g_fail; uint8_t g_byte;
+    gray_get_diag(&g_ok, &g_fail, &g_byte);      /* 灰度 I2C 诊断快照(纯读) */
+    uint8_t gray_fresh = gray_frame_fresh();
+
+#if SERIAL_STUDIO_CSV
+    /* Serial Studio Quick Plot: 纯数字逗号分隔, 一行一帧。
+     * 字段: ms,state,gray_err,lost,fresh,ok_delta,fail_delta,raw_or_neg1,gray_hits,line_ok,gray_min_hits,aim_stop_us,trim,
+     *       arc_kp_x100,kd_x100,arc_scale_x1000,base,line_kp_x100,dy,seg,turn_diff,left_duty,right_duty,
+     *       nodata,protect_ms,startprot_ms。
+     * delta 比累计计数更适合看波形: 正常 fail_delta 应长期为 0。 */
+    static uint32_t s_ok_prev = 0u;
+    static uint32_t s_fail_prev = 0u;
+    float kp, kd, hkp; int base;
+    float dy_dbg, left_duty, right_duty;
+    float lock_unused, turn_diff, online_unused;
+    uint8_t seg_u8, nodata_u8;
+    uint8_t gray_hits, gray_line_ok, gray_min_hits;
+    uint16_t protect_ms, startprot_ms;
+    app_tune_get(&kp, &kd, &base, &hkp);
+    app_get_vel_debug(&dy_dbg, 0, 0, 0);
+    app_get_vel_out(&left_duty, &right_duty);
+    app_get_blind_debug(&lock_unused, &turn_diff, &online_unused);
+    app_get_track_debug(&seg_u8, &nodata_u8, &protect_ms, &startprot_ms);
+    app_eval_gray_gate(g_byte, gray_fresh, &gray_hits, &gray_line_ok, &gray_min_hits);
+    uint32_t ok_delta = g_ok - s_ok_prev;
+    uint32_t fail_delta = g_fail - s_fail_prev;
+    s_ok_prev = g_ok;
+    s_fail_prev = g_fail;
+
+    uart_print_u32(g_tick_ms);                              uart_puts(",");
+    uart_print_u32((uint32_t)app_get_state());              uart_puts(",");
+    uart_print_i32((int32_t)gray_err);                      uart_puts(",");
+    uart_print_u32((uint32_t)gray_is_lost());               uart_puts(",");
+    uart_print_u32((uint32_t)gray_fresh);                   uart_puts(",");
+    uart_print_u32(ok_delta);                               uart_puts(",");
+    uart_print_u32(fail_delta);                             uart_puts(",");
+    uart_print_i32(gray_fresh ? (int32_t)g_byte : -1);      uart_puts(",");
+    uart_print_u32((uint32_t)gray_hits);                    uart_puts(",");
+    uart_print_u32((uint32_t)gray_line_ok);                  uart_puts(",");
+    uart_print_u32((uint32_t)gray_min_hits);                 uart_puts(",");
+    uart_print_u32(app_get_aim_stop_us());                   uart_puts(",");
+    uart_print_i32((int32_t)app_get_trim());                uart_puts(",");
+    uart_print_u32((uint32_t)(kp * 100.0f + 0.5f));         uart_puts(",");
+    uart_print_u32((uint32_t)(kd * 100.0f + 0.5f));         uart_puts(",");
+    uart_print_u32((uint32_t)(app_tune_get_arc_scale() * 1000.0f + 0.5f));
+    uart_puts(",");
+    uart_print_i32((int32_t)base);                          uart_puts(",");
+    uart_print_i32((int32_t)(hkp * 100.0f + (hkp >= 0.0f ? 0.5f : -0.5f)));
+    uart_puts(",");
+    uart_print_i32((int32_t)(dy_dbg >= 0.0f ? dy_dbg + 0.5f : dy_dbg - 0.5f));
+    uart_puts(",");
+    uart_print_u32((uint32_t)seg_u8);
+    uart_puts(",");
+    uart_print_i32((int32_t)(turn_diff >= 0.0f ? turn_diff + 0.5f : turn_diff - 0.5f));
+    uart_puts(",");
+    uart_print_i32((int32_t)(left_duty >= 0.0f ? left_duty + 0.5f : left_duty - 0.5f));
+    uart_puts(",");
+    uart_print_i32((int32_t)(right_duty >= 0.0f ? right_duty + 0.5f : right_duty - 0.5f));
+    uart_puts(",");
+    uart_print_u32((uint32_t)nodata_u8);
+    uart_puts(",");
+    uart_print_u32((uint32_t)protect_ms);
+    uart_puts(",");
+    uart_print_u32((uint32_t)startprot_ms);
+    uart_puts("\r\n");
+#else
     float tl, ml, tr, mr, ol, or_;
     app_get_vel_debug(&tl, &ml, &tr, &mr);   /* 速度环只读快照(mm/s), 无副作用 */
     app_get_vel_out(&ol, &or_);              /* 两轮当前下发占空(-1000..1000) */
 
-    /* 灰度偏差通道: IDLE 态没人刷新灰度(track 环只在 RUN 跑), 由这里代刷,
-     * 方便台架"挥黑胶带看读数"; RUN 态只旁观缓存, 刷新权归 track 环独有。 */
-    float gray_err;
-    if (app_get_state() == APP_ST_IDLE) {
-        gray_err = (float)gray_get_error();      /* IDLE: 代为刷新(含一次 I2C 读) */
-    } else {
-        gray_err = (float)gray_last_error();     /* 其它态: 纯读缓存, 零副作用 */
-    }
-    uint32_t g_ok, g_fail; uint8_t g_byte;
-    gray_get_diag(&g_ok, &g_fail, &g_byte);      /* 灰度 I2C 诊断快照(纯读) */
     uint32_t imu_ok, imu_fail;
     imu_get_diag(&imu_ok, &imu_fail, 0);         /* IMU I2C 诊断快照(纯读) */
     float hkp;
@@ -263,6 +497,7 @@ static void task_vofa(void)
         (float)app_get_trim(),           /* ch23: 右轮占空配平('T'/'t' 调, 每按±3; 调好报值写死) */
     };
     vofa_send(ch, 24);
+#endif
 }
 
 /* 任务表: { 函数, 周期ms, 计时器(初值=周期), 就绪标志 } —— 周期与交接说明 §4 / app.h 的 APP_*_DT_MS 一致 */
@@ -412,7 +647,11 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r34: AIM fixed-pointing mode (pan=stop pulse, tilt ramp to 116; place target at laser dot)] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r37: AIM restored + gray shadow gate CSV] (IDLE, press START) ---\r\n");
+    cmd_print_help();
+#if CMD_TEXT_ECHO
+    uart_puts("[CSV] ms,state,gray_err,lost,fresh,ok_delta,fail_delta,raw_or_neg1,gray_hits,line_ok,gray_min_hits,aim_stop_us,trim,arc_kp_x100,kd_x100,arc_scale_x1000,base,line_kp_x100,dy,seg,turn_diff,left_duty,right_duty,nodata,protect_ms,startprot_ms\r\n");
+#endif
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

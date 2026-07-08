@@ -3,7 +3,7 @@
 北邮 2026 电赛小车赛道题固件:220×120cm 场地、双 R=40cm 半圆弧黑线 + 空白直线段,
 要求自动巡迹一圈(F1 ≤30s)、定点瞄准(F2 ≤5s)、巡迹+对靶联动(F3 ≤40s)、四圈连跑(发挥)。
 
-**当前状态**:循迹全线已通(单圈 ≈20s,真机验收)·舵机/云台调试版 r36(AIM 默认几何解算)。
+**当前状态**:循迹全线已通(单圈 ≈20s,真机验收)·r37 AIM 云台恢复 + Serial Studio CSV 灰度抗阴影/I2C 排障版。
 
 ---
 
@@ -16,7 +16,7 @@
 | 编码器 | MG310 自带 AB 相(左 QEI 4倍频 / 右 GPIO 1倍频) | 左 TIMG8 PA29/PA30;右 PA27/PB24。**r20 起仅作遥测,不参与控制** |
 | 灰度 | 感为 8 路 IIC 版(Rev V3.6),地址 0x4C | I2C1 PB2/PB3 |
 | IMU | MPU6050(GY-521),yaw 左转为正 | I2C0 PA0/PA1 |
-| 云台 | PAN=180°位置舵机(TIMA1 PA17),TILT=机械固定 ≈26° 上仰 | 舵机轨开关 PB23(限制⑥) |
+| 云台 | 水平 360°连续舵机实际接 TILT/PA16; 垂直 180°位置舵机实际接 PAN/PA17 | 舵机轨开关 PB23(限制⑥) |
 | 激光 | 装于 PAN 云台,与镜头位同轴向;供电走舵机轨 | — |
 | 视觉(选配) | K230(CanMV),跑 `k230_aim_main.py` | UART2:PB17→K230 RXD,PB16←TXD |
 | 人机 | START=PB19 MODE=PA22 蜂鸣=PB18 RUN灯=PA24 ERR灯=PA26 | 调试串口 UART0(XDS110) |
@@ -54,13 +54,14 @@ START 起跑;运动中任意键=急停;ESTOP 下 2s 内三连按 START 软清障
 
 - **环境**:CCS Theia + MSPM0 SDK 2.10.00.04 + SysConfig 1.26.2 + tiarmclang(工程内 .cproject 已配好,导入即编)
 - **水印制度**:每次烧录后看 boot 串口横幅的 rN 版本号,与预期不符=烧了个寂寞
-- **VOFA+**:JustFloat 引擎,COM=XDS110 口,115200。要点通道:I0 状态机 · I4 DeltaYaw/目标 · I10 灰度质心 · I11 丢线 · I12 航向(左转+) · I15 灰度原始字节(白地=255) · I13/I14 灰度 I2C 成败计数 · I20 当前段目标航向 · I21 转向量 · I23 右轮配平
-- **命令台**(VOFA 发送框):`1~4` 模式 · `s` 启动 · `x` 急停 · `P/p` KP±0.5 · `D/d` KD±1 · `V/v` 基速±25 · `H/h` 航向KP±0.5 · `T/t` 右轮配平±3 · `O/o` 舵机轨上/下电 · `C` 云台居中 · `J/j` PAN±5° · `K/k` TILT±5° · `?` 回显。舵机手动命令仅 IDLE/STOP 生效。
+- **Serial Studio 临时灰度排障模式**:`empty.c` 里 `SERIAL_STUDIO_CSV=1` 时,串口每 50ms 输出纯数字 CSV: `ms,state,gray_err,lost,fresh,ok_delta,fail_delta,raw_or_neg1,gray_hits,line_ok,gray_min_hits,aim_stop_us,trim,arc_kp_x100,kd_x100,arc_scale_x1000,base,line_kp_x100,dy,seg,turn_diff,left_duty,right_duty,nodata,protect_ms,startprot_ms`。Serial Studio 选 XDS110 串口、115200、Quick Plot 即可;重点看 `fail_delta` 是否随晃线冒尖、`raw_or_neg1` 白地是否约 255；若 `fresh=0` 则 `raw_or_neg1=-1`,表示原始字节无效。`gray_hits` 是本帧黑点数,`line_ok=1` 才会被循迹当真线; `G/g` 调 `gray_min_hits` 抗阴影,`Y/y` 调水平连续舵机停转脉宽 `aim_stop_us`。CSV 模式下 `P/p D/d A/a V/v H/h T/t G/g Y/y O/o` 字符调参静默生效,参数列会跟着跳变;突然右转时看 `seg` 是否提前从 0 跳到 1、`turn_diff` 是否为负、左右占空是否拉开。
+- **VOFA+**:`SERIAL_STUDIO_CSV=0` 时恢复 JustFloat 24 通道。要点通道:I0 状态机 · I10 灰度质心 · I11 丢线 · I15 灰度原始字节(白地=255) · I13/I14 灰度 I2C 成败计数 · I20 当前段目标航向 · I21 转向量 · I23 右轮配平
+- **命令台**(VOFA 发送框):`1~4` 模式 · `s` 启动 · `x` 急停 · `r` STOP 回待机/ESTOP 三连确认 · `P/p` 弯道KP±0.5 · `D/d` KD±1 · `A/a` 灰度质心到角度比例±0.01 · `V/v` 基速占空±10 · `H/h` 直线航向KP±0.5 · `T/t` 右轮配平±3 · `G/g` 灰度门槛±1 · `O/o` 舵机轨上/下电 · `C` 云台中位 · `J/j` PAN±1° · `K/k` TILT±5° · `Y/y` 连续舵机停转脉宽±5us · `?` 回显+帮助。
 - ⚠ 串口在线调的参数**断电即失**,定版值必须写回 `app.c` 常量再烧
 
 ### 舵机/云台快调
 
-当前安全初值在 `servo.c`:50Hz、0.6~2.4ms、PAN 10..170°、TILT 40..140°、中位 90°。先不装负载或松开连杆,VOFA 发送 `C` 居中,再发 `O` 给舵机轨上电;用 `J/j` 扫 PAN、`K/k` 扫 TILT,找到不顶机械的端点后回填 `SERVO_*_DEG_MIN/MAX`。AIM 默认 `AIM_FIXED_MODE=0`: 模式 2 会按几何解算给 PAN≈133°、TILT≈116°;若水平反向,改 `AIM_PAN_SIGN`/`AIM_PAN_ZERO_DEG`。
+当前安全初值在 `servo.c`:50Hz、0.6~2.4ms、PAN 10..170°、TILT 40..140°、中位 90°。r37 实测通道角色相反:水平 360° 连续舵机在 `SERVO_TILT/PA16`,垂直 180° 位置舵机在 `SERVO_PAN/PA17`。AIM 默认 `AIM_FIXED_MODE=1`: 前 305ms 给水平连续舵机手势脉宽,之后发 `aim_stop_us` 停转保持;垂直位置舵机斜坡到 `AIM_ELEV_DEG`。若水平舵机蠕转,在 IDLE/STOP 下先 `O` 上电,用 `Y/y` 微调到不转,再把回显值写回 `AIM_CONT_STOP_US`。
 
 ## 5. K230 视觉(选配,拔掉不影响 F1~F3)
 

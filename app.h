@@ -121,9 +121,17 @@ uint8_t app_get_mode(void);
 void app_estop_ack(void);
 
 /**
- * @brief 串口在线调参一步: which='p'(循迹KP,±0.05) / 'd'(KD,±0.25) / 'v'(基速,±25mm/s)
- *        / 'h'(盲走航向锁KP,±0.5,可负) / 't'(右轮占空配平,±3,可负,夹±40), dir=±1
- * @note  KP/KD 热改 g_pid_track, 下一拍生效; 基速带 [100,600] 安全夹; 航向KP夹±10。
+ * @brief 软回待机: 停电机/断舵机轨/清声光/清运行进度, 保留当前模式与在线调参值。
+ * @note  给串口 'r' 使用: STOP 态可直接回 IDLE; ESTOP 仍建议走 app_estop_ack 三连确认。
+ */
+void app_return_idle(void);
+
+/**
+ * @brief 串口在线调参一步: which='p'(弯道KP,±0.5) / 'd'(KD,±1)
+ *        / 'a'(灰度质心->角度比例,±0.01) / 'v'(基速占空,±10)
+ *        / 'h'(直线航向锁KP,±0.5,可负) / 't'(右轮占空配平,±3,可负,夹±40)
+ *        / 'g'(灰度认线最小黑点数,±1,夹1..4), dir=±1
+ * @note  参数下一拍生效; 基速夹 [60,300]; 航向KP夹±10; 配平夹±40; 灰度门槛夹 [1,4]。
  *        现场整定免重编译。
  */
 void app_tune_step(char which, int dir);
@@ -131,8 +139,24 @@ void app_tune_step(char which, int dir);
 /** @brief 读当前在线调参值(kp/kd/基速/航向kp), 供串口命令台 '?' 回显; 不需要的传 NULL */
 void app_tune_get(float *kp, float *kd, int *base, float *hkp);
 
+/** @brief 读当前弯道灰度质心到角度的比例系数, 即 'A'/'a' 在线调的值 */
+float app_tune_get_arc_scale(void);
+
 /** @brief 读当前右轮占空配平值(r24, 'T'/'t' 在线调), 供 VOFA ch23/'?' 回显 */
 int app_get_trim(void);
+
+/** @brief 水平 360° 连续舵机停转脉宽微调: dir>0 加 5us, dir<0 减 5us, 立即生效 */
+void app_aim_stop_trim(int dir);
+
+/** @brief 读取当前水平 360° 连续舵机停转脉宽(us), 供串口回显 */
+uint32_t app_get_aim_stop_us(void);
+
+/** @brief 读灰度抗阴影门控调试量: 最近黑点数/是否通过/最小黑点门槛 */
+void app_get_gray_gate_debug(uint8_t *hits, uint8_t *line_ok, uint8_t *min_hits);
+
+/** @brief 用当前灰度原始字节评估抗阴影门控, 供非 RUN 遥测/状态回显实时显示 */
+void app_eval_gray_gate(uint8_t byte, uint8_t fresh,
+                        uint8_t *hits, uint8_t *line_ok, uint8_t *min_hits);
 
 /**
  * @brief 读取速度内环调试快照(目标/实测速度, 单位 mm/s), 给 VOFA 波形用
@@ -153,5 +177,15 @@ void app_get_vel_out(float *out_l, float *out_r);
  * @note  纯只读。复盘: ch20 vs ch12 之差 × HKP 应≈ch21; ch22 齿高<600 = 闪断缴械证据。
  */
 void app_get_blind_debug(float *lock, float *turn, float *online);
+
+/**
+ * @brief 读取循迹段状态调试量, 用于判断是否误切段导致突然转向。
+ * @param seg 当前段号 0=A→B空白 1=B→C弧 2=C→D空白 3=D→A弧
+ * @param nodata CTY 漏积分计数; 越小越像"有线",越大越像"空白"
+ * @param protect_ms 段切换保护剩余 ms
+ * @param startprot_ms 起步保护剩余 ms
+ */
+void app_get_track_debug(uint8_t *seg, uint8_t *nodata,
+                         uint16_t *protect_ms, uint16_t *startprot_ms);
 
 #endif /* APP_H */
