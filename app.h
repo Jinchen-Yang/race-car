@@ -150,6 +150,16 @@ void app_tune_get(float *kp, float *kd, int *base, float *hkp);
 int app_get_trim(void);
 
 /**
+ * @brief 微调水平 360° 连续舵机的停转脉宽(r37 'G'/'g', ±5us, 夹 1300~1700), 立即应用消蠕转
+ * @param dir >0 加、<0 减
+ * @note  先 'O' 上电舵机轨后调; 调到舵机纹丝不动, 把回显 us 写死进 app.c 的 AIM_CONT_STOP_US 再烧。
+ */
+void app_aim_stop_trim(int dir);
+
+/** @brief 读当前连续舵机停转脉宽(us), 供 'G/g' 回显; 调好写死进 AIM_CONT_STOP_US */
+uint32_t app_get_aim_stop_us(void);
+
+/**
  * @brief 读取速度内环调试快照(目标/实测速度, 单位 mm/s), 给 VOFA 波形用
  * @param tgt_l/meas_l/tgt_r/meas_r 输出指针(不需要的传 NULL)
  * @note  纯只读、无副作用, 可放任意调试任务里周期调; 整定内环 PID 就盯"目标 vs 实测"这两条线。

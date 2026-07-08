@@ -21,23 +21,49 @@
 #include "ti_msp_dl_config.h"
 #include "servo.h"
 
-/* ===== 调参/标定占位（一律 #define，不填真值，待标定） ===== */
+/* ===== 调参/标定参数 ===== */
 
 /* PWM 周期：50Hz 舵机标准 20ms。须与 SysConfig 里 PWM_SERVO 的实际定时周期一致，
  * 否则脉宽换算会整体偏。若改 SysConfig 周期，这里同步改。 */
-#define SERVO_PERIOD_US     20000u   /* 待整定: PWM 周期(us), 须与 SysConfig PWM_SERVO 周期一致 */
+#define SERVO_PERIOD_US     20000u   /* PWM 周期(us), 与 empty.syscfg PWM_SERVO timerCount=40000 对应 */
 
-/* 角度->脉宽端点（占位，对应 0° 与 180°）。MG996R 名义 0.5~2.5ms，
- * 但各舵机端点有差异，装好后用 servo_set_angle 扫到两端实测机械极限再回填。 */
-#define SERVO_PULSE_MIN_US  500u     /* 待整定: 对应 SERVO_DEG_MIN 的脉宽(us), 占位 0.5ms */
-#define SERVO_PULSE_MAX_US  2500u    /* 待整定: 对应 SERVO_DEG_MAX 的脉宽(us), 占位 2.5ms */
+/* 电气脉宽先收窄到 0.6~2.4ms，避开多数模拟舵机端点死区；确认型号/机构后再放宽。 */
+#define SERVO_PAN_PULSE_MIN_US    600u
+#define SERVO_PAN_PULSE_MAX_US   2400u
+#define SERVO_TILT_PULSE_MIN_US   600u
+#define SERVO_TILT_PULSE_MAX_US  2400u
 
-/* 角度限位（占位）。先给满量程 0~180，标定后按云台机械行程收窄，防舵机/结构互顶堵转。 */
-#define SERVO_DEG_MIN       0        /* 待整定: 允许最小角度(度), 占位 0 */
-#define SERVO_DEG_MAX       180      /* 待整定: 允许最大角度(度), 占位 180 */
+/* 机械角度限位。PAN 目标解算约 133°，安全范围 10..170 足够；TILT 先给 40..140 防抬臂顶结构。
+ * 现场扫角后，把真正不顶机械的范围回填到这里。 */
+#define SERVO_PAN_DEG_MIN       10
+#define SERVO_PAN_DEG_MAX       170
+#define SERVO_PAN_INIT_DEG      90
+#define SERVO_PAN_REVERSE        0
 
-/* 初始化安全中位角（占位）。两路上电先给中位，避免后续上电源轨时大幅扫动。 */
-#define SERVO_INIT_DEG      90       /* 待整定: 初始中位角(度), 占位 90 */
+#define SERVO_TILT_DEG_MIN      40
+#define SERVO_TILT_DEG_MAX     140
+#define SERVO_TILT_INIT_DEG     90
+#define SERVO_TILT_REVERSE       0
+
+typedef struct {
+    int deg_min;
+    int deg_max;
+    int init_deg;
+    uint32_t pulse_min_us;
+    uint32_t pulse_max_us;
+    uint8_t reverse;
+} servo_cal_t;
+
+static const servo_cal_t s_cal[2] = {
+    { SERVO_PAN_DEG_MIN,  SERVO_PAN_DEG_MAX,  SERVO_PAN_INIT_DEG,
+      SERVO_PAN_PULSE_MIN_US,  SERVO_PAN_PULSE_MAX_US,  SERVO_PAN_REVERSE  },
+    { SERVO_TILT_DEG_MIN, SERVO_TILT_DEG_MAX, SERVO_TILT_INIT_DEG,
+      SERVO_TILT_PULSE_MIN_US, SERVO_TILT_PULSE_MAX_US, SERVO_TILT_REVERSE },
+};
+
+static int      s_angle_deg[2] = { SERVO_PAN_INIT_DEG, SERVO_TILT_INIT_DEG };
+static uint32_t s_pulse_us[2]  = { 1500u, 1500u };
+static uint8_t  s_rail_on      = 0;
 
 /* 把“目标脉宽(us)”换算成要写入 CCR 的计数值。
  *
@@ -56,40 +82,68 @@ static uint32_t pulse_to_ccr(uint32_t pulse_us)
     return load - high;                                       /* 反比: 高电平越多 CCR 越小 */
 }
 
-/* 把角度(已限位)线性映射到脉宽(us)：deg=MIN->PULSE_MIN, deg=MAX->PULSE_MAX。 */
-static uint32_t deg_to_pulse_us(int deg)
+static int clamp_angle(int ch, int deg)
 {
-    /* 线性插值: pulse = MIN + (deg-DEG_MIN)*(MAX-MIN)/(DEG_MAX-DEG_MIN) */
-    int span_deg   = SERVO_DEG_MAX - SERVO_DEG_MIN;          /* 角度跨度, 占位 180 */
-    uint32_t span_us = SERVO_PULSE_MAX_US - SERVO_PULSE_MIN_US; /* 脉宽跨度, 占位 2000us */
-    uint32_t off   = (uint32_t)(deg - SERVO_DEG_MIN) * span_us / (uint32_t)span_deg;
-    return SERVO_PULSE_MIN_US + off;
+    if (deg < s_cal[ch].deg_min) deg = s_cal[ch].deg_min;
+    if (deg > s_cal[ch].deg_max) deg = s_cal[ch].deg_max;
+    return deg;
+}
+
+/* 把角度(已限位)按通道标定线性映射到脉宽(us)。 */
+static uint32_t deg_to_pulse_us(int ch, int deg)
+{
+    int span_deg = s_cal[ch].deg_max - s_cal[ch].deg_min;
+    if (span_deg <= 0) return s_cal[ch].pulse_min_us;
+
+    int phy_deg = s_cal[ch].reverse ? (s_cal[ch].deg_max + s_cal[ch].deg_min - deg) : deg;
+    uint32_t span_us = s_cal[ch].pulse_max_us - s_cal[ch].pulse_min_us;
+    uint32_t off = (uint32_t)(phy_deg - s_cal[ch].deg_min) * span_us / (uint32_t)span_deg;
+    return s_cal[ch].pulse_min_us + off;
 }
 
 void servo_init(void)
 {
     /* 两路先给安全中位(占位 90°)，使上电后即便随后通电源轨也从中位起步，不大幅扫动。
      * 此时电源轨默认关(SERVO_EN=Low)，舵机不动；写 CCR 只是把待输出脉宽备好。 */
-    servo_set_angle(SERVO_PAN,  SERVO_INIT_DEG);
-    servo_set_angle(SERVO_TILT, SERVO_INIT_DEG);
+    servo_set_angle(SERVO_PAN,  s_cal[SERVO_PAN].init_deg);
+    servo_set_angle(SERVO_TILT, s_cal[SERVO_TILT].init_deg);
 
     /* 启动 TIMA1 计数, 开始出 50Hz PWM。SysConfig 生成的 PWM init 不会自动启动计数。 */
     DL_TimerA_startCounter(PWM_SERVO_INST);
 
-    /* 不在此给电源轨上电: 题目限制⑥要求默认不通电, 上电由 servo_rail_enable 显式控制。 */
+    /* 显式保持电源轨断电: 防以后 SysConfig 初值被误改成高电平。 */
+    servo_rail_enable(0);
 }
 
 void servo_set_angle(int ch, int deg)
 {
     if (ch != SERVO_PAN && ch != SERVO_TILT) return;   /* 非法通道直接忽略, 防越界写 */
 
-    if (deg < SERVO_DEG_MIN) deg = SERVO_DEG_MIN;      /* 软件限位: 夹紧到允许角度范围 */
-    if (deg > SERVO_DEG_MAX) deg = SERVO_DEG_MAX;      /* 防舵机/结构互顶堵转 */
-
-    uint32_t pulse_us = deg_to_pulse_us(deg);          /* 角度 -> 脉宽(us) */
+    deg = clamp_angle(ch, deg);                        /* 按通道软件限位，防舵机/结构互顶堵转 */
+    uint32_t pulse_us = deg_to_pulse_us(ch, deg);      /* 角度 -> 脉宽(us) */
     uint32_t ccr      = pulse_to_ccr(pulse_us);        /* 脉宽 -> CCR(与占空成反比) */
+    s_angle_deg[ch] = deg;
+    s_pulse_us[ch]  = pulse_us;
 
     /* ch=PAN -> CCP0 通道, ch=TILT -> CCP1 通道（写入对应 CC 寄存器索引） */
+    if (ch == SERVO_PAN) {
+        DL_TimerA_setCaptureCompareValue(PWM_SERVO_INST, ccr, GPIO_PWM_SERVO_C0_IDX);
+    } else {
+        DL_TimerA_setCaptureCompareValue(PWM_SERVO_INST, ccr, GPIO_PWM_SERVO_C1_IDX);
+    }
+}
+
+void servo_set_pulse_us(int ch, uint32_t pulse_us)
+{
+    if (ch != SERVO_PAN && ch != SERVO_TILT) return;
+
+    /* 直接按脉宽驱动(绕过角度限位/映射), 供 360° 连续舵机调速/停转微调。
+     * 安全夹在 0.6~2.4ms, 防越界脉宽把舵机顶到电气死区。s_angle_deg 对连续舵机无意义, 不更新。 */
+    if (pulse_us < 600u)  pulse_us = 600u;
+    if (pulse_us > 2400u) pulse_us = 2400u;
+    uint32_t ccr = pulse_to_ccr(pulse_us);
+    s_pulse_us[ch] = pulse_us;
+
     if (ch == SERVO_PAN) {
         DL_TimerA_setCaptureCompareValue(PWM_SERVO_INST, ccr, GPIO_PWM_SERVO_C0_IDX);
     } else {
@@ -100,8 +154,27 @@ void servo_set_angle(int ch, int deg)
 void servo_rail_enable(int on)
 {
     if (on) {
+        s_rail_on = 1u;
         DL_GPIO_setPins(GPIO_IOB_PORT, GPIO_IOB_SERVO_EN_PIN);   /* 拉高: 给舵机电源轨通电 */
     } else {
+        s_rail_on = 0u;
         DL_GPIO_clearPins(GPIO_IOB_PORT, GPIO_IOB_SERVO_EN_PIN); /* 拉低: 断开舵机电源轨(默认态) */
     }
+}
+
+int servo_get_angle(int ch)
+{
+    if (ch != SERVO_PAN && ch != SERVO_TILT) return 0;
+    return s_angle_deg[ch];
+}
+
+uint32_t servo_get_pulse_us(int ch)
+{
+    if (ch != SERVO_PAN && ch != SERVO_TILT) return 0u;
+    return s_pulse_us[ch];
+}
+
+int servo_rail_is_enabled(void)
+{
+    return (int)s_rail_on;
 }

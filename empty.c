@@ -86,6 +86,16 @@ static void uart_print_u32(uint32_t v)
     uart_puts(&b[i]);
 }
 
+static void uart_print_i32(int32_t v)
+{
+    if (v < 0) {
+        uart_puts("-");
+        uart_print_u32((uint32_t)(-v));
+    } else {
+        uart_print_u32((uint32_t)v);
+    }
+}
+
 /* —— 调度任务 —— */
 
 /* 心跳灯: 每 500ms 翻一次 -> 1Hz 慢闪(活着的最直观证据, 死机/卡死一眼可见) */
@@ -117,8 +127,53 @@ static void task_key(void)
  *   '1'~'4' = 设模式(仅待机) | 's' = 启动(仅待机) | 'x' = 急停(任何时候)
  *   'P'/'p' = 循迹 KP 增/减  | 'D'/'d' = KD 增/减 | 'V'/'v' = 基速增/减
  *   'H'/'h' = 盲走航向锁 KP 增/减(±0.5, 可负) | 'T'/'t' = 右轮配平 ±3(车右偏按T左偏按t)
+ *   'O'/'o' = 舵机轨上/下电 | 'C' = 云台居中 | 'J'/'j' = PAN ±5° | 'K'/'k' = TILT ±5°
+ *   'G'/'g' = 水平连续舵机停转脉宽 ±5us(消蠕转, 先 O 上电再调)
  *   '?' = 报状态
  * UART0 未开 RX 中断: 靠 10ms 轮询 + 硬件 RX FIFO 缓冲, 手敲命令绰绰有余。 */
+static int cmd_servo_allowed(void)
+{
+    app_state_e st = app_get_state();
+    return (st == APP_ST_IDLE || st == APP_ST_STOP);
+}
+
+static void cmd_print_servo_inline(void)
+{
+    uart_puts(" SERVO=");
+    uart_puts(servo_rail_is_enabled() ? "ON" : "OFF");
+    uart_puts(" PAN=");
+    uart_print_i32(servo_get_angle(SERVO_PAN));
+    uart_puts("/");
+    uart_print_u32(servo_get_pulse_us(SERVO_PAN));
+    uart_puts("us TILT=");
+    uart_print_i32(servo_get_angle(SERVO_TILT));
+    uart_puts("/");
+    uart_print_u32(servo_get_pulse_us(SERVO_TILT));
+    uart_puts("us");
+}
+
+static void cmd_servo_blocked(void)
+{
+    uart_puts("[CMD] servo blocked: use IDLE/STOP (x for ESTOP, o for rail off)\r\n");
+}
+
+static void cmd_servo_status_line(void)
+{
+    uart_puts("[CMD]");
+    cmd_print_servo_inline();
+    uart_puts("\r\n");
+}
+
+static void cmd_servo_step(int ch, int delta_deg)
+{
+    if (!cmd_servo_allowed()) {
+        cmd_servo_blocked();
+        return;
+    }
+    servo_set_angle(ch, servo_get_angle(ch) + delta_deg);
+    cmd_servo_status_line();
+}
+
 static void cmd_print_status(void)
 {
     float kp, kd, hkp; int base;
@@ -137,6 +192,7 @@ static void cmd_print_status(void)
         if (trim < 0) { uart_puts("-"); uart_print_u32((uint32_t)(-trim)); }
         else          {                 uart_print_u32((uint32_t)( trim)); }
     }
+    cmd_print_servo_inline();
     uart_puts("\r\n");
 }
 static void task_cmd(void)
@@ -165,6 +221,38 @@ static void task_cmd(void)
         case 'h': app_tune_step('h', -1); cmd_print_status(); break;
         case 'T': app_tune_step('t', +1); cmd_print_status(); break;
         case 't': app_tune_step('t', -1); cmd_print_status(); break;
+        case 'O':
+            if (cmd_servo_allowed()) { servo_rail_enable(1); cmd_servo_status_line(); }
+            else                     { cmd_servo_blocked(); }
+            break;
+        case 'o':
+            servo_rail_enable(0);
+            cmd_servo_status_line();
+            break;
+        case 'C':
+            if (cmd_servo_allowed()) {
+                servo_set_angle(SERVO_PAN, 90);
+                servo_set_angle(SERVO_TILT, 90);
+                cmd_servo_status_line();
+            } else {
+                cmd_servo_blocked();
+            }
+            break;
+        case 'J': cmd_servo_step(SERVO_PAN,  +1); break;   /* r37: ±5→±1° 提高定角精度 */
+        case 'j': cmd_servo_step(SERVO_PAN,  -1); break;
+        case 'K': cmd_servo_step(SERVO_TILT, +5); break;
+        case 'k': cmd_servo_step(SERVO_TILT, -5); break;
+        case 'G':
+        case 'g':
+            if (cmd_servo_allowed()) {
+                app_aim_stop_trim(c == 'G' ? +1 : -1);   /* 水平连续舵机停转脉宽微调, 立即应用 */
+                uart_puts("[CMD] cont stop us=");
+                uart_print_u32(app_get_aim_stop_us());
+                uart_puts(" (tune G/g to no rotation)\r\n");
+            } else {
+                cmd_servo_blocked();
+            }
+            break;
         case '?': cmd_print_status(); break;
         default:  break;   /* \r \n 及未知字符: 静默忽略 */
         }
@@ -416,7 +504,7 @@ int main(void)
 #endif
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r35: IMU idle-recal + start gate (issue#3); stale-frame D-hold + AIM->RUN D-skip (issue#2)] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r37: AIM fixed-point + 360-servo sweep gesture (cont on TILT/PA16, elev on PAN/PA17); r35/r36 kept] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */
