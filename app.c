@@ -226,7 +226,7 @@ extern volatile uint32_t g_tick_ms;
  * 沿线位置自由 -> 固定指向, 现场把靶摆到光点落点。AIM_FIXED_MODE 置0可恢复
  * 几何解算方案(换装位置舵机到水平轴后用)。 */
 #define AIM_FIXED_MODE     1
-#define AIM_TILT_FIX_DEG   116   /* 待标: TILT 指向角(若舵机中位≈水平, 116=26°上仰理论值);
+#define AIM_TILT_FIX_DEG   150   /* 待标: TILT 指向角(若舵机中位≈水平, 116=26°上仰理论值);
                                   * 现场按"光点落在靶心高度"微调, 靶面每 1cm ≈ 0.84° */
 #define AIM_TILT_RAMP_DEG  2.0f  /* TILT 斜坡步进(°/10ms拍): ~0.13s 到位, 防满速甩头 */
 
