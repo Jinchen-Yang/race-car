@@ -121,6 +121,21 @@ uint8_t app_get_mode(void);
 void app_estop_ack(void);
 
 /**
+ * @brief 灌入陀螺零偏校准是否有效(r35 issue #3: START 起跑门控凭证)
+ * @param ok 非0=有效(boot 校准+漂移自检合格), 0=无效(禁止 START)
+ * @note  由 empty.c 在 app_init() 之后、把 boot 校准结论传进来。IDLE 态静置≥2s 会
+ *        自动重校并刷新此凭证; 无效时按 START 被拦(红灯亮), 校成后放行。
+ */
+void app_set_imu_cal_valid(uint8_t ok);
+
+/**
+ * @brief 关闭 IDLE 静置重校 + START 校准门控(r35 issue #3 评审发现③)
+ * @note  仅供 GRAY_SOLO_TEST 台架路径用: 该模式 IMU 未 init, 若不关, IDLE 重校会往
+ *        0x68 发流量污染灰度独占诊断, 并因 yaw 恒定误判静止而锁死 START。
+ */
+void app_idle_recal_disable(void);
+
+/**
  * @brief 串口在线调参一步: which='p'(循迹KP,±0.05) / 'd'(KD,±0.25) / 'v'(基速,±25mm/s)
  *        / 'h'(盲走航向锁KP,±0.5,可负) / 't'(右轮占空配平,±3,可负,夹±40), dir=±1
  * @note  KP/KD 热改 g_pid_track, 下一拍生效; 基速带 [100,600] 安全夹; 航向KP夹±10。

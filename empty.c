@@ -305,6 +305,10 @@ int main(void)
     servo_init();                     /* TIMA1 50Hz 启动, 舵机轨 EN 保持断电 */
     k230_init();                      /* 清收帧状态 + 兜底使能 UART2 RX 外设级中断 */
 
+    /* r35 issue #3: boot 陀螺校准结论, app_init 后灌给 app 层做 START 门控。默认 0
+     * (init 失败 / GRAY_SOLO_TEST 屏蔽 IMU 时保持禁跑), 仅校准+漂移双合格才置 1。 */
+    int boot_imu_cal_ok = 0;
+
 #if GRAY_SOLO_TEST
     uart_puts("[TEST] GRAY_SOLO: IMU I2C traffic fully muted\r\n");
 #else
@@ -394,6 +398,7 @@ int main(void)
         }
         if (cal_ok) {
             led_err_set(0);           /* 校准+漂移双合格: 红灯灭 */
+            boot_imu_cal_ok = 1;      /* r35 issue #3: 放行 START 的凭证 */
             uart_puts("IMU calibrated & drift OK.\r\n");
         } else {
             uart_puts("[ERR] IMU calibrate/drift failed after 3 attempts\r\n");
@@ -403,9 +408,15 @@ int main(void)
 #endif /* GRAY_SOLO_TEST */
 
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
+#if GRAY_SOLO_TEST
+    app_idle_recal_disable();         /* r35 issue#3 评审③: 灰度独占台架 IMU 未 init, 关 IDLE 重校/门控 */
+    (void)boot_imu_cal_ok;            /* solo build 下未用, 消 unused 警告 */
+#else
+    app_set_imu_cal_valid((uint8_t)boot_imu_cal_ok);  /* r35 issue #3: 灌 boot 校准结论做 START 门控 */
+#endif
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r34: AIM fixed-pointing mode (pan=stop pulse, tilt ramp to 116; place target at laser dot)] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r35: IMU idle-recal + start gate (issue#3); stale-frame D-hold + AIM->RUN D-skip (issue#2)] (IDLE, press START) ---\r\n");
 
     while (1) {
         sched_run(g_tasks, N_TASKS);  /* 跑所有"到点就绪"的任务 */

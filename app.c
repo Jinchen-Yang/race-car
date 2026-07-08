@@ -179,6 +179,19 @@ extern volatile uint32_t g_tick_ms;
 #define EXIT_ALIGN_MAX_MS   800  /* 对正超时保险: 超时放弃, 按当前航向直接走 */
 #define LOST_BLIND_MAX    2000   /* 待整定: 盲走最大里程当量, 超限报错(占位) */
 
+/* --- r35 issue #3: IDLE 静置自动重校陀螺零偏 + 校准失败禁止起跑 ---
+ * 背景: "首跑顺畅、后续跑不直"头号嫌疑 = IMU 零偏温漂/校准时机。全工程原先只在
+ * boot 校准一次(见 empty.c), 芯片升温后零偏漂移, 未去偏置的纯积分 yaw 最坏 1200°/min,
+ * 航向锁追着漂移参考跑必发散。本组常量控制"车在赛道摆好、静置够久 -> 自动重标零偏"。
+ * 静置判据用零副作用的 imu_get_yaw() 逐拍差分当角速度代理(挪车/回正车头 Δyaw 远超门限)。 */
+#define IDLE_RECAL_EN       1     /* 总开关: 1=启用 IDLE 静置重校+校准门控 START; 0=退回旧行为 */
+#define IDLE_STILL_MS       2000  /* 判"静置"所需连续静止时长(ms): 与 boot 漂移自检窗同长 */
+#define IDLE_STILL_YAW_TH   0.02f /* 每 FSM 拍(10ms) |Δyaw| 门限(°): 0.02°/10ms=2°/s。
+                                   * 远高于校准残余零漂(<0.3°/s死区级), 远低于挪车/对头
+                                   * 的角速度(≥20°/s), 干净区分"静止 vs 有人动车"。 */
+#define IDLE_DRIFT_TOL_DEG  1.0f  /* 重校后 2s 漂移自检门限(°/2s): 与 boot 自检同门限(<1°/2s
+                                   * 才算零偏干净)。不过关=重校中途被扰动, 新偏置作废、拦跑。 */
+
 /* --- 瞄准 --- */
 #define AIM_TIMEOUT_MS    5000   /* 待整定: 单点瞄准限时(题目 F2≤5s, 占位) */
 #define AIM_TOL_PX        8      /* 待整定: K230 命中容差(像素)(占位) */
@@ -305,6 +318,10 @@ static float    g_datum_yaw   = 0.0f;   /**< 出发基准角 z = START 时车头
 static uint16_t g_protect_ms  = 0;      /**< 段切换保护窗(ms) */
 static uint16_t g_startprot_ms = 0;     /**< 起步保护(ms): 强制 seg0+无视灰度 */
 static float    g_dyaw_prev   = 0.0f;   /**< SelfTurn D 项上拍 DeltaYaw */
+static uint8_t  g_skip_d_once = 0;      /**< r35 issue #2b: 置1令 track 环下一拍强制跳过 D
+                                          * (令 g_dyaw_prev=dy, D=0)。AIM→RUN 返回时用:
+                                          * s_seg_prev 在 AIM 期冻结、返回时段号未变, 段切换
+                                          * 清零不触发, 靠此标志补上"恢复第一拍跳过假微分"。 */
 static uint8_t g_node_pending = 0;      /**< r20: 待 FSM 消费的节点事件数(track 写, FSM 读, 同主循环无竞态) */
 static uint8_t g_node_hit_fired = 0;    /**< r20: 本次压线的"压线节点"已发过(one-shot) */
 /* --- 状态机入态检测 + STOP 声光一次性 --- */
@@ -326,6 +343,15 @@ static float g_heading_kp = HEADING_KP;  /**< 盲走航向锁 KP(串口 'H'/'h' 
 static int   g_trim_duty  = DRIVE_TRIM_DUTY_R; /**< r24: 右轮占空配平('T'/'t' ±3, 夹±40) */
 static uint8_t g_aim_return_run = 0;/**< AIM 结束后回 RUN(F3 中途对靶)还是进 STOP(F2) */
 static int32_t g_run_beep_ms = 0;   /**< RUN 态过点声光剩余时长(ms), 非阻塞关断 */
+/* --- r35 issue #3: IDLE 静置重校 + START 校准门控状态 --- */
+static uint8_t g_imu_cal_ok    = 0; /**< 陀螺零偏当前是否有效(START 放行凭证)。boot 结果由
+                                      * app_set_imu_cal_valid() 灌入, IDLE 重校成功后刷新。 */
+static float   g_idle_last_yaw = 0.0f; /**< IDLE 静置检测: 上一拍航向(逐拍差分算角速度代理) */
+static uint16_t g_idle_still_ms = 0; /**< IDLE 已连续静止时长(ms), 达 IDLE_STILL_MS 触发重校 */
+static uint8_t g_idle_cal_done = 0; /**< 本次静置episode是否已重校(冷却, 防每拍反复标定; 动车清0) */
+static uint8_t g_idle_recal_en = 1; /**< IDLE 静置重校+START门控运行时开关。GRAY_SOLO 台架下由
+                                      * empty.c 调 app_idle_recal_disable() 关掉(IMU 未 init,
+                                      * 免往 0x68 发流量污染诊断、免锁死 START)。 */
 
 /* ============================================================================
  *  小工具
@@ -556,16 +582,25 @@ void track_loop_step(void)
     } else if (g_protect_ms > 0u) {
         /* 刚进弧就丢线(冲过线头): 保护窗内向弧内侧强拐找线(CTY 手法) */
         dy = LAP_CW ? -ARC_SEARCH_DEG : +ARC_SEARCH_DEG;
+    } else if (!fresh) {
+        /* r35 issue #2a: I2C 失败帧(stale)——数据没更新, 维持上一拍 dy 而非归零。
+         * 归零会在 KD 下打出 stale→0→恢复 的单拍假 D 踢(±KD·dy≈±50@KD=2.0),
+         * "冻结上一拍判断"则 D=(dy-g_dyaw_prev)=0, 无瞬变。此分支必在弧段
+         * (seg 0/2 直线段由上面两支先接管), 故 on_ladder=1 沿用弧线 KP,
+         * 与被维持的那拍增益一致(否则会误用直线 KP=6.0 把维持值放大 1.7 倍)。 */
+        dy = g_dyaw_prev;
+        on_ladder = 1;
     } else {
-        dy = 0.0f;                                      /* 弧上短暂全白/失败帧: 保持直走 */
+        dy = 0.0f;                                      /* 弧上真·全白/全黑(fresh): 保持直走 */
     }
 
     /* 7) SelfTurn PD -> 差速占空('P/p' 调弧线KP ±0.5, 'D/d' 调 KD ±1)。
      * r32 段切换清 D 历史: dy 换源(航向↔查表↔强拐)瞬间差分无意义, 防单拍甩头。 */
     {
         static uint8_t s_seg_prev = 0;
-        if (g_seg != s_seg_prev) {
+        if (g_seg != s_seg_prev || g_skip_d_once) {  /* r35: 段切换 或 AIM→RUN 恢复首拍 */
             s_seg_prev = g_seg;
+            g_skip_d_once = 0;
             g_dyaw_prev = dy;
         }
     }
@@ -758,6 +793,29 @@ static int keypoint_event(void)
  *  状态机
  * ==========================================================================*/
 
+#if IDLE_RECAL_EN
+/**
+ * @brief 重校后短漂移自检(r35 issue#3): 手动以 10ms 节拍推进积分, 测 2s 净漂移是否达标。
+ * @return 1=|漂移|<IDLE_DRIFT_TOL_DEG(零偏干净); 0=漂移过大(被扰动, 新偏置不可信)
+ * @note  与 boot 漂移自检同款手法(empty.c)。阻塞期 task_imu 不会并发(协作式调度,
+ *        主循环卡在 app_fsm_step 里), 故此处是唯一积分点, 不会重复推进。仅 IDLE 静置后调。
+ */
+static int idle_drift_ok(void)
+{
+    float y0 = imu_get_yaw();
+    uint32_t t0 = g_tick_ms, t_upd = t0;
+    while ((g_tick_ms - t0) < IDLE_STILL_MS) {          /* 复用 2s 静置窗当自检窗 */
+        if ((g_tick_ms - t_upd) >= (uint32_t)APP_FSM_DT_MS) {
+            t_upd = g_tick_ms;
+            imu_update();                               /* 唯一积分点(见 @note) */
+        }
+    }
+    float dy = imu_get_yaw() - y0;
+    if (dy < 0.0f) dy = -dy;
+    return (dy < IDLE_DRIFT_TOL_DEG);
+}
+#endif
+
 void app_fsm_step(void)
 {
     /* 入态检测: 本拍状态 != 上一拍 = 刚进入该态, 用于到点声光等"只做一次"的动作。 */
@@ -776,8 +834,57 @@ void app_fsm_step(void)
             /* 前 mode*2 格里"亮灭交替" -> 闪 mode 次, 其余时间灭 */
             led_run_set((slot < (uint16_t)(g_run_mode * 2u)) && ((slot & 1u) == 0u));
         }
+#if IDLE_RECAL_EN
+        /* r35 issue #3: 静置≥2s 自动重校陀螺零偏(堵温漂头号嫌疑)。imu_get_yaw() 零副作用,
+         * 逐拍差分当角速度代理; 连续静止累计, 挪车/对车头(Δyaw 超门限)一动即清零重来。
+         * g_idle_recal_en=0(GRAY_SOLO 台架, empty.c 关掉)时整块跳过, 免往 0x68 发流量污染诊断。 */
+        if (g_idle_recal_en) {
+            float yaw_now = imu_get_yaw();
+            float d = yaw_now - g_idle_last_yaw;
+            if (d < 0.0f) d = -d;
+            g_idle_last_yaw = yaw_now;
+            if (d <= IDLE_STILL_YAW_TH) {
+                if (g_idle_still_ms < IDLE_STILL_MS) {
+                    g_idle_still_ms = (uint16_t)(g_idle_still_ms + APP_FSM_DT_MS);
+                }
+                if (g_idle_still_ms >= IDLE_STILL_MS && !g_idle_cal_done) {
+                    /* 静置够久且本轮静置尚未标定: 重标零偏 + 短漂移自检(照 boot 手法, 防被扰动的
+                     * 坏偏置覆盖 boot 好偏置又放行=重演 issue#3)。阻塞 ~3s(IDLE 无控制环可容忍),
+                     * 双灯亮解释卡顿。三种收尾:
+                     *  ①校准+漂移双合格 -> 刷新起跑凭证、红灯灭;
+                     *  ②采样成功但漂移不过(重校中途被扰动, 新偏置已覆盖且可疑) -> 拦跑亮红, 等再静置重校;
+                     *  ③采样失败(总线抖动, imu_gyro_calibrate 未覆盖旧偏置) -> 不下调已有凭证
+                     *    (boot/上次有效校准仍在, 免瞬时抖动锁死已合格的车)。 */
+                    g_idle_cal_done = 1;
+                    led_run_set(1); led_err_set(1);          /* 双灯亮 = 正在重校 */
+                    int cal = (imu_gyro_calibrate() == IMU_OK);
+                    if (cal && idle_drift_ok()) {
+                        g_imu_cal_ok = 1;
+                        led_err_set(0);
+                    } else if (cal) {
+                        g_imu_cal_ok = 0;                    /* 新偏置可疑: 禁跑, 待再次静置重校 */
+                        led_err_set(1);
+                    } else {
+                        led_err_set(g_imu_cal_ok ? 0 : 1);   /* 采样失败: 保留已有凭证 */
+                    }
+                    g_idle_last_yaw = imu_get_yaw();   /* 重校/自检推进过 yaw, 重置基准防误判运动 */
+                }
+            } else {
+                g_idle_still_ms = 0;    /* 检测到动车: 计时清零, 待再次静置自动重校 */
+                g_idle_cal_done = 0;
+            }
+        }
+#endif
         if (g_start_req) {
             g_start_req = 0;
+#if IDLE_RECAL_EN
+            if (g_idle_recal_en && !g_imu_cal_ok) {
+                /* r35 issue #3: 无有效零偏校准, 禁止起跑(未去偏置纯积分 yaw 最坏 1200°/min)。
+                 * 红灯亮=未就绪; 把车静置 2s 会自动重校, 红灯灭后再按 START。 */
+                led_err_set(1);
+                break;
+            }
+#endif
             /* 启动前复位: 清 PID 历史 + 内环累加 + 盲走里程 + 关键点进度, 防上次残留。 */
             pid_reset(&g_pid_track);
             pid_reset(&g_pid_vel_l);
@@ -803,6 +910,7 @@ void app_fsm_step(void)
             g_protect_ms = 0;
             g_startprot_ms = START_PROTECT_MS;
             g_dyaw_prev = 0.0f;
+            g_skip_d_once = 0;   /* r35: 起步保护窗已管首拍 D, 清掉可能滞留的跳过标志 */
             /* r19 卫生项(审计): 消费搬车期间滞留的编码器增量 + 清测速滤波,
              * 防起步首拍速度环吃到 ±1500 假速度脉冲(非 RUN 态无人读 delta, 会攒一大坨) */
             (void)enc_get_delta(ENC_LEFT);
@@ -891,6 +999,8 @@ void app_fsm_step(void)
                     pid_reset(&g_pid_vel_l);
                     pid_reset(&g_pid_vel_r);
                     g_vel_out_l = g_vel_out_r = 0.0f;
+                    g_skip_d_once = 1;   /* r35 issue #2b: 停车5s后 g_dyaw_prev 仍是停前旧值,
+                                          * 令 track 环恢复第一拍跳过 D, 免吃一记假微分甩头。 */
                     led_run_set(1);
                     g_state = APP_ST_RUN;
                 } else {
@@ -1109,8 +1219,32 @@ void app_init(void)
     g_protect_ms = 0;
     g_startprot_ms = 0;
     g_dyaw_prev = 0.0f;
+    g_skip_d_once = 0;
     g_blind_ref = 0;   /* (遗留字段, 保持归零) */
     g_stop_beep_ms = 0;
+    /* r35 issue #3: 校准门控/静置检测状态。g_imu_cal_ok 先置 0(悲观), 由 empty.c 在
+     * app_init 后调 app_set_imu_cal_valid() 灌入 boot 校准结果; IDLE 静置重校再刷新。 */
+    g_imu_cal_ok    = 0;
+    g_idle_last_yaw = imu_get_yaw();
+    g_idle_still_ms = 0;
+    g_idle_cal_done = 0;
+    g_idle_recal_en = 1;   /* 默认启用; GRAY_SOLO 台架下由 empty.c 调 app_idle_recal_disable() 关 */
     g_prev_state = APP_ST_IDLE;
     g_state = APP_ST_IDLE;
+}
+
+void app_set_imu_cal_valid(uint8_t ok)
+{
+    /* r35 issue #3: 由 boot(empty.c)把开机静止校准+漂移自检的结论灌进 START 门控:
+     * boot 合格 -> 摆好即可 START(IDLE 静置重校只是锦上添花的刷新);
+     * boot 失败 -> START 被拦, 须车静置 2s 自动重校成功(红灯灭)后才放行。 */
+    g_imu_cal_ok = ok ? 1u : 0u;
+}
+
+void app_idle_recal_disable(void)
+{
+    /* r35 issue #3(评审发现③): GRAY_SOLO_TEST 台架下 IMU 从未 init(仍 sleep), empty.c
+     * 调此关掉 IDLE 静置重校与 START 门控——否则会往 0x68 发校准流量污染灰度独占诊断,
+     * 并因 yaw 恒定而误判"静止"对着睡着的芯片乱标定 / 锁死 START。 */
+    g_idle_recal_en = 0;
 }
