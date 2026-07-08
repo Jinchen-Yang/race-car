@@ -7,7 +7,7 @@
  *   PWM_SERVO = TIMA1, 50Hz：CC0=PA17 云台 PAN，CC1=PA16 云台 TILT
  *   SERVO_EN  = GPIO_IOB 组 PB23：舵机电源轨开关（高=通电；初值低=断电）
  *
- * 约定：ch 0=PAN 1=TILT；角度 deg 0~180°，软件限位后映射到脉宽 0.5~2.5ms（占位待标定）。
+ * 约定：ch 0=PAN 1=TILT；角度 deg 0~180°，按每路标定表限位后映射到安全脉宽。
  * 边沿对齐 PWM 极性同 motor.c：高电平计数 = LOAD - CCR，CCR 越大占空越小，
  *   故脉宽越宽 -> CCR 越小（详见 servo.c 的 pulse_to_ccr()）。
  *
@@ -32,11 +32,28 @@ void servo_init(void);
 /**
  * @brief 设置某一路舵机的目标角度。
  * @param ch  舵机通道：SERVO_PAN(0)=水平 / SERVO_TILT(1)=俯仰，其它值忽略。
- * @param deg 目标角度，单位度，范围 0~180（超出按 SERVO_DEG_MIN/MAX 限位夹紧）。
- * @note  内部按 角度->脉宽(0.5~2.5ms 占位端点)->CCR 写入；CCR 与占空成反比同 motor.c。
- *        端点脉宽与角度限位均为占位 #define，待对实际舵机标定后修正（见 servo.c）。
+ * @param deg 目标角度，单位度，范围 0~180（超出按该通道 DEG_MIN/MAX 限位夹紧）。
+ * @note  内部按 角度->该通道安全脉宽端点->CCR 写入；CCR 与占空成反比同 motor.c。
+ *        端点脉宽与角度限位在 servo.c 顶部集中配置，现场扫限位后回填。
  */
 void servo_set_angle(int ch, int deg);
+
+/**
+ * @brief 直接按脉宽(us)驱动某路，绕过角度映射。
+ * @param ch 通道 SERVO_PAN/SERVO_TILT；其它值忽略。
+ * @param pulse_us 目标脉宽(us)，内部安全夹在 0.6~2.4ms。
+ * @note  给 360° 连续旋转舵机用：脉宽=转速/方向(≈1.5ms 停)，不是角度。也用于停转脉宽现场微调。
+ */
+void servo_set_pulse_us(int ch, uint32_t pulse_us);
+
+/** @brief 读取最近一次写入该通道的限位后角度；非法通道返回 0。 */
+int servo_get_angle(int ch);
+
+/** @brief 读取最近一次写入该通道的目标脉宽(us)；非法通道返回 0。 */
+uint32_t servo_get_pulse_us(int ch);
+
+/** @brief 读取舵机电源轨状态，非 0 = 已请求上电。 */
+int servo_rail_is_enabled(void);
 
 /**
  * @brief 控制舵机电源轨（SERVO_EN=PB23）通断。
