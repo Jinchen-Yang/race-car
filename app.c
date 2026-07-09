@@ -132,7 +132,7 @@ extern volatile uint32_t g_tick_ms;
  *   时 16 帧只走 96/64/38mm, 补偿角只有 13.8°/9.2°/5.5°(需要 15.8°), 欠转与右甩会回来一部分。
  *   根子是 SEG_BLANK_TH 用帧数判距离事件, 出弧点的几何位置本就随车速漂 —— 该常量是红线
  *   (调松到 63 曾致误触发链, 见 SEG_LINE_TH 注释), 不动。故低速跑弧前先复核本条。 */
-#define GRAY_LOOKAHEAD_MM 110.0f
+#define GRAY_LOOKAHEAD_MM 150.0f
 
 /* --- r25 段状态机(CTY Task4StateUpdate 移植) --- */
 #define LAP_CW            1      /* 题目正式路线 A→B 先行 = 顺时针圈(两弧皆右转); 反向跑改0 */
