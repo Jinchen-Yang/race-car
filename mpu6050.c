@@ -17,7 +17,7 @@
  */
 #include "mpu6050.h"
 #include "bsp_i2c.h"   /* I2C 收口: i2c_write_reg / i2c_read_reg(返回值式) / i2c_read_regs */
-#include "encoder.h"    /* 互补滤波: enc_get_count 读轮计数推算差速航向变化率 */
+/* r39: 原 #include "encoder.h" 随互补滤波一并移除 —— 本模块不再依赖编码器(理由见 imu_update)。 */
 
 /* empty.c 的 1ms 全局时基(SysTick 里自增), imu_update 用它算真实积分 dt */
 extern volatile uint32_t g_tick_ms;
@@ -85,17 +85,11 @@ extern volatile uint32_t g_tick_ms;
  * 循迹转弯角速度 ≥20°/s 远高于死区, 不受影响。若发现慢弯航向跟不上再调小。 */
 #define IMU_GYRO_DEADBAND_DPS   0.3f    /* 待整定: 角速度死区(°/s) */
 
-/* ===== 互补滤波: 陀螺(短时精确) + 编码器差速(无长期漂移) =====
- * 纯陀螺积分的致命缺陷: 零漂累积, 跑 15s 一圈漂 ≈7.5°。
- * 编码器差速 yaw_rate = (vR-vL)/track 无累积误差, 但单帧噪声大(尤其右轮单相 254cnt/rev)。
- * 互补滤波: fused = alpha*gyro + (1-alpha)*encoder, alpha 大=重陀螺(抗噪)轻编码器(修漂移)。
- * 0.98 意味着 98% 信任陀螺瞬时值, 2% 信任编码器——编码器只负责"慢慢把陀螺漂移拉回来"。 */
-#define IMU_FUSION_ALPHA        0.98f   /* 待整定: 互补系数, 越大越重陀螺(抗噪), 越小越重编码器(修漂移快) */
-#define IMU_WHEEL_TRACK_MM      140.0f  /* 待实测: 左右轮距(mm), 估值! 增益∝轮距, 实测方法见注释 */
-                                        /* 实测法: 让车原地转 N 圈(如3圈), 读 IMU 累计转角 Δyaw_enc,
-                                         * 同时读右轮里程 Δs, 则 track = Δs*360 / (Δyaw_enc * π) */
-#define IMU_ENC_MM_PER_CNT_L    (3.1415926f * 47.0f / ENC_L_CNT_PER_REV)  /* 左轮 mm/计数, 与 app.c 一致 */
-#define IMU_ENC_MM_PER_CNT_R    (3.1415926f * 47.0f / ENC_R_CNT_PER_REV)  /* 右轮 mm/计数 */
+/* ===== r39: 已移除"陀螺 + 编码器差速"互补滤波 =====
+ * 原 IMU_FUSION_ALPHA / IMU_WHEEL_TRACK_MM / IMU_ENC_MM_PER_CNT_L/R 一并删除,
+ * 判据与推导见 imu_update() 内注释。
+ * 纯陀螺积分确有零漂累积(跑 15s 一圈漂 ≈7.5°), 但本车的编码器比陀螺更不可信,
+ * 拿它去"修"陀螺是把噪声源当基准。漂移的正确解药是 app.c 模式4 的每圈限幅重锚。 */
 
 /* ===================== 模块内部状态 ===================== */
 static float s_yaw_deg     = 0.0f;  /**< 累计航向角(度)，imu_get_yaw 积分结果，imu_reset_yaw 清零 */
@@ -272,50 +266,35 @@ void imu_update(void)
         gz_dps = 0.0f;   /* 死区内归零, 不积分(但仍参与融合, 只是贡献为0) */
     }
 
-    /* ===== 互补滤波: 陀螺 + 编码器差速 =====
-     * 编码器差速推算 yaw 变化率: yaw_rate_enc = (vR - vL) / track * (180/π)
-     *   vR, vL = 左右轮瞬时速度(mm/s) = delta_cnt * mm_per_cnt / dt
-     *   track  = 左右轮距(mm)
-     * 互补: fused_rate = alpha * gyro_rate + (1-alpha) * enc_rate
-     *   alpha=0.98: 98% 陀螺(抗高频噪声), 2% 编码器(慢慢修正陀螺漂移)
-     * 首拍(dt_ms 兜底)或编码器异常时退化为纯陀螺。 */
-    {
-        static int32_t s_encL_prev = 0, s_encR_prev = 0;
-        static uint8_t s_fusion_init = 0;
-
-        int32_t encL = enc_get_count(ENC_LEFT);
-        int32_t encR = enc_get_count(ENC_RIGHT);
-
-        if (!s_fusion_init) {
-            /* 首拍: 只存基准, 不融合(编码器差值无意义) */
-            s_encL_prev = encL;
-            s_encR_prev = encR;
-            s_fusion_init = 1;
-            s_yaw_deg += gz_dps * ((float)dt_ms / 1000.0f);
-        } else {
-            int32_t dL = encL - s_encL_prev;
-            int32_t dR = encR - s_encR_prev;
-            s_encL_prev = encL;
-            s_encR_prev = encR;
-
-            /* 左右轮行进距离(mm) */
-            float distL = (float)dL * IMU_ENC_MM_PER_CNT_L;
-            float distR = (float)dR * IMU_ENC_MM_PER_CNT_R;
-
-            /* 差速推算 yaw 变化率(°/s): Δyaw = (distR-distL)/track * 180/π, rate = Δyaw/dt */
-            float dt_s = (float)dt_ms / 1000.0f;
-            float enc_yaw_rate = 0.0f;
-            if (IMU_WHEEL_TRACK_MM > 1.0f && dt_s > 0.001f) {
-                float dyaw_deg = (distR - distL) / IMU_WHEEL_TRACK_MM * (180.0f / 3.1415926f);
-                enc_yaw_rate = dyaw_deg / dt_s;
-            }
-
-            /* 互补融合 */
-            float fused_rate = IMU_FUSION_ALPHA * gz_dps
-                             + (1.0f - IMU_FUSION_ALPHA) * enc_yaw_rate;
-            s_yaw_deg += fused_rate * dt_s;
-        }
-    }
+    /* ===== 纯陀螺 Z 积分 =====
+     * r39 移除 c7443f0 引入的"陀螺 + 编码器差速"互补滤波(fused = 0.98*gyro + 0.02*enc)。
+     * 三条独立理由:
+     *   ① 喂的是本车自己判过死刑的传感器。app.c:141-147 台架实锤: 左编码器间歇无信号、
+     *      右编码器 ±20% 电气毛刺; DRIVE_OPEN_LOOP=1 正是为把它们踢出控制路径。融合把
+     *      它们从 IMU 后门放了回来, 而且直接写进航向基准 —— 两段空白直线(seg0/seg2)的
+     *      绝对航向锚 z / z+180 完全骑在它们身上。
+     *   ② "只占 2%" 是量纲错觉。enc_yaw_rate 是把每拍距离差除以 dt(10ms) 得到的速率,
+     *      等于放大 100 倍。实际灵敏度: (distR-distL) 每差 1mm 就往 yaw 注入 0.82°/s 偏置,
+     *      而一拍车只走约 3.4mm(340mm/s)。左右里程系统性差几成, 直线就被弯成弧。
+     *   ③ dL 由 enc_get_count(ENC_LEFT) 直接做差, 但 encoder.c:83-85 明确警告该返回值是
+     *      16 位硬件计数、会回绕、禁止跨回绕做差(右轮走的是不回绕的软件 int32, 两边不对称)。
+     *      一次回绕注入 yaw 的阶跃 = 65536*0.02*0.145131/140*57.2958 ≈ 78°;
+     *      340mm/s 下左轮 2343 计数/秒, 每 ~28s 必踩一次(模式4 四圈连跑跑不掉)。
+     * 另注: 开机那 2 秒静止漂移自检(empty.c) 车不动 -> dL=dR=0 -> 融合项恒为 0,
+     *      对本故障完全免疫 —— 自检报一个漂亮的漂移数字, 车照样走不直。
+     * 沿革(git 实证, 别再被合并搞丢一次): 融合由 c7443f0 引入; 合并 1ef842e 按其信息
+     *   ("不采纳依赖不可靠编码器(左死右噪)的融合")正确地把它挡在外面 —— 该 commit 的
+     *   mpu6050.c 确为纯陀螺; 但紧接着的合并 971a80a("非舵机保留本地改动")整份取回了
+     *   c7443f0 侧的 mpu6050.c, 融合就这么悄悄复活并烧上了车。
+     * 而真机验收"循迹全线已通(单圈≈20s)"的 r37(aeaa2bb) 用的正是本行这个纯陀螺积分。
+     *   所以 r39 不是删掉一个能用的漂移补偿, 而是把 yaw 管线恢复到验收过的那一版。
+     * 零偏由 imu_gyro_calibrate() 静止标定 + IMU_GYRO_DEADBAND_DPS 死区压制。
+     * ⚠已知上限(与 r37 验收态相同, 非本次引入): 纯陀螺无长期基准。模式4 每圈过 A 有
+     *   限幅重锚(±10°, app.c)兜底, 但模式1/3 单圈内没有任何漂移修正, 而两段空白直线
+     *   (seg0/seg2)靠绝对航向锚 z / z+180 行驶且没有横向反馈 —— 漂移直接变成横向走偏。
+     *   根治见 现场调试指挥手册 §2 修复①(温漂补偿 bias(T), temp 已在 out->temp 里)
+     *   与 修复②(START 前静置重校 + 校准失败禁止 START)。 */
+    s_yaw_deg += gz_dps * ((float)dt_ms / 1000.0f);
 }
 
 float imu_get_yaw(void)
@@ -339,5 +318,8 @@ void imu_reset_yaw(void)
  *      （注意：单 MPU6050 无磁力计，yaw 无绝对参考，加速度计帮不了 yaw 的长期漂移，
  *       真要消 yaw 漂移需外加磁力计/视觉/编码器航迹推算做融合）。
  *   2) 卡尔曼：状态=角度+角速度偏置，过程/观测噪声为待整定参数。
- *   3) 工程折中：本车有左右编码器，可用差速里程计推 yaw 与陀螺积分互补，鲁棒性更好。
+ *   3) 工程折中：本车有左右编码器，可用差速里程计推 yaw 与陀螺积分互补。
+ *      ⚠ c7443f0 试过，r39 撤回：前提是编码器可信，而本车两个都不可信（左死右噪）。
+ *      要走这条路，先把编码器修好并实测轮距，再用 enc_get_delta（带回绕修正）而非
+ *      enc_get_count，且必须能被一个"车在动"的自检覆盖——静止自检看不见这类故障。
  */
