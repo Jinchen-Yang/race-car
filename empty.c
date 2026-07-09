@@ -647,7 +647,7 @@ int main(void)
     app_init();                       /* 建 3 个 PID + 状态置 IDLE(电机不动, 等 START 键) */
 
     /* 版本水印: 每轮整定改一次尾号, boot 一眼确认烧录生效(防"调了参数烧了个寂寞") */
-    uart_puts("\r\n--- MSPM0 boot [r37: AIM restored + gray shadow gate CSV] (IDLE, press START) ---\r\n");
+    uart_puts("\r\n--- MSPM0 boot [r38: K230 visual aim (cont-servo velocity loop + tilt dy loop)] (IDLE, press START) ---\r\n");
     cmd_print_help();
 #if CMD_TEXT_ECHO
     uart_puts("[CSV] ms,state,gray_err,lost,fresh,ok_delta,fail_delta,raw_or_neg1,gray_hits,line_ok,gray_min_hits,aim_stop_us,trim,arc_kp_x100,kd_x100,arc_scale_x1000,base,line_kp_x100,dy,seg,turn_diff,left_duty,right_duty,nodata,protect_ms,startprot_ms\r\n");

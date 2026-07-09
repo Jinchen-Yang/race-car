@@ -80,6 +80,30 @@ extern volatile uint32_t g_tick_ms;
 #define ARC_ERR_TO_DEG    0.12f  /* 待整定: 质心偏差→角度(°)换算系数, 越大弧上纠偏越猛 */
 #define ARC_ERR_DEG_LIM   45.0f /* 弧线段连续质心偏差限幅(°), 防极端值 */
 
+/* --- r39 弧线曲率前馈(恢复 r19 TRACK_FF_GAIN 的思想, 改由场地几何直接给) ---
+ * 病("弧上太肉, 出弯"): 弧段是纯 PD 打在灰度质心上。R=400mm 的弧要求一个恒定的转向量,
+ *   纯 P 只能靠"一直保持一个偏差"把它顶出来 —— 稳态偏差不可能为零, 且正比于车速:
+ *     diff_ss = base·track/(2R) = 26.25 @base=150   (对象增益 G 约掉, 与电池电压无关)
+ *     稳态质心 = diff_ss/(g_kp_arc·g_arc_err_to_deg) = 26.25/0.42 ≈ 62 ≈ 0.6 个探头间距
+ *   线常驻阵列外侧(弯道外侧) -> gray_hits 掉到 1 -> line_ok=0 -> 落进 dy=0 分支在 R=400
+ *   的弯道上直走 -> 出弯。再攒够 SEG_BLANK_TH(16帧≈320ms) 还会伪造一个 C 节点, 段状态机
+ *   1→2 切到绝对航向保持(z+180), 车就彻底开出去了。
+ * 不能靠加 KP 治: r32 已实证弧上 KP=6.0 会激出 S 型极限环(见 TRACK_KP_ARC 注释), 才降到 3.5。
+ * 药: 恒定转向量交给前馈, P 只负责纠偏 —— 低增益(不振荡)与零稳态偏差兼得。这正是 r19
+ *   TRACK_FF_GAIN 的原话("前馈接管稳态转向后 err_ss→0, 线回传感器中央"); r25 的 CTY 重写
+ *   把它丢了(该宏至今定义着却无人引用), 病就回来了。本场地两段弧同半径同方向(LAP_CW=右转),
+ *   故前馈是个常数, 比 r19 的"快慢平均差"估计法更直接、更不怕噪声。
+ * 推导: 维持半径 R 需 ω=v/R; 两轮速差 Δv=ω·track; diff 产生 Δv=2·diff·G; v=base·G
+ *       => diff_ff = base·track/(2R)
+ * 副作用(有意为之): 前馈在整个弧段生效, 含 line_ok=0 那一拍 —— 丢线时 PD 归零(没有测量就
+ *   不猜偏差), 但车按标称曲率继续画弧等线回来, 而不是直走。这堵上了上面那个 dy=0 的洞。
+ * ⚠ WHEEL_TRACK_MM 是估值(与 r39 删掉的 mpu6050.c IMU_WHEEL_TRACK_MM 同源), 前馈量正比于它。
+ *   实测法: 车原地转 N 圈, 读右轮里程 Δs 与 IMU 累计转角 Δyaw, track = Δs·360/(Δyaw·π)。
+ *   验证判据: 弧上稳态时 CSV 的 gray_err 应落回 0 附近(改前常驻 ≈+62), ch21 差速常驻 ≈-26。 */
+#define ARC_FF_EN         1      /* 0 = 回退到 r38 纯 PD 行为(一键对照, 不必翻 git) */
+#define ARC_RADIUS_MM     400.0f /* 场地半圆弧半径(题目 Figure1: R=40cm) */
+#define WHEEL_TRACK_MM    140.0f /* ⚠估值! 左右轮距(mm), 实测后回填 —— 前馈量正比于它 */
+
 /* --- r25 段状态机(CTY Task4StateUpdate 移植) --- */
 #define LAP_CW            1      /* 题目正式路线 A→B 先行 = 顺时针圈(两弧皆右转); 反向跑改0 */
 #define TURN_DIFF_LIM     150    /* SelfTurn 差速限幅(占空) */
@@ -251,6 +275,48 @@ extern volatile uint32_t g_tick_ms;
 #define AIM_CONT_SWEEP_US  255   /* 手势转速偏移: 1495-255=1240us, 保住实测"距离正好"那档 */
 #define AIM_CONT_SWEEP_DIR (-1)  /* 手势方向: 转反了改成 (+1) */
 #define AIM_CONT_SWEEP_MS  305u  /* 进 AIM 后前多少 ms 做"转向靶"手势, 之后停转保持 */
+
+/* ===== 连续舵机角速度标定 (r38 "角度环"地基): ω(脉宽) 分段线性模型 =====
+ * 连续舵机无位置反馈, 靠"脉宽=转速/方向"驱动。要把用户实测的粗略转速用起来, 先建一个
+ * ω↔脉宽 的标定, 让上层能按"期望角速度"下发脉宽:
+ *
+ *   |脉宽 - STOP| <= DEAD          -> 不转(死区; 对应"要按 2~3 次 k 才起转")
+ *   越过死区后近似线性:  ω ≈ (|脉宽-STOP| - DEAD) / KUS
+ *   反解(下层用):  脉宽 = STOP ± (DEAD + |ω|*KUS)     符号由 ω 定
+ *
+ * 标定点: 用户实测"从静止按两次 k ≈ 1 圈/4s = 90°/s"。据此 KUS≈2us/(°/s) 时,
+ *   90°/s -> DEAD+90*2 ≈ 200us 偏移(停转侧), 量级与"两次 k"吻合。
+ * STOP 用运行时 g_cont_stop_us(可 Y/y 现场微调), 不写死这里。
+ * ⚠ 闭环对 KUS/DEAD 不敏感: 视觉反馈会自收敛, 本模型只需量级对, 定环增益与限幅用。
+ * 方向: 实测 脉宽<STOP(小脉宽)=顺时针('k'), 脉宽>STOP=逆时针('K')。cont_omega_to_pulse
+ *   里约定 ω>0 -> 脉宽>STOP(逆时针), 具体转向由上层 AIM_VIS_PAN_SIGN 吸收, 这里只保证单调。 */
+#define AIM_CONT_DEAD_US     20u    /* 死区半宽(us): 起转门槛, 现场按"刚不蠕转到刚起转"量 */
+#define AIM_CONT_KUS_PER_DPS 2.0f   /* 斜率(us per °/s): 见上标定点推导 */
+#define AIM_CONT_MAX_OFF_US  350u   /* 脉宽偏移限幅(us): 防冲到电气死区(≈±165°/s 封顶) */
+
+/* ===== K230 视觉闭环瞄准 (r38: 水平连续舵机视觉速度环 + 垂直位置舵机 dy 位置环) =====
+ * 依赖 k230_get_aim(dx,dy,found)。符号约定(k230_aim_main.py): 靶在画面右 dx>0, 靶在下 dy>0。
+ * 结构(两轴解耦):
+ *   水平(连续舵机 AIM_CONT_CH): 视觉速度环。err_x=dx-DX0; ω=clamp(KP_X*err_x); 经上面速度
+ *     模型换算脉宽下发。|err_x|<TOL 即发停转脉宽保持。连续舵机=天然速度执行器, 像素误差→
+ *     角速度是最自然的 P 环, 不需积分角度, 也不受开环漂移影响。
+ *   垂直(位置舵机 AIM_ELEV_CH): 以实测 AIM_ELEV_DEG 为前馈, 再按 dy 积分微调(斜坡限速)。
+ *   视差补偿: 激光笔//摄像头, 有固定基线偏移 => 激光正落靶心时摄像头看到靶心偏 (DX0,DY0)
+ *     像素。车停位/靶距固定 => 该偏移是常量, 台架标定一次回填(见 k230_aim_main.py CX0/CY0 注)。
+ * 无视觉(found=0)回退: 前 AIM_CONT_SWEEP_MS 做转向靶手势捕获, 之后停转; 垂直只走前馈斜坡。
+ *   拔摄像头/K230 静默也不卡死(k230_get_aim 非阻塞返回 found=0)。
+ * AIM_VIS_MODE=0 时退回 AIM_FIXED_MODE 固定手势(本段全部失效)。 */
+#define AIM_VIS_MODE          1      /* 1=K230 视觉闭环(本段生效); 0=退回固定手势 */
+#define AIM_AIMPOINT_DX0      0      /* 待标定: 激光落靶心时 K230 报的 dx(px), 视差水平零点 */
+#define AIM_AIMPOINT_DY0      0      /* 待标定: 激光落靶心时的 dy(px), 视差垂直零点 */
+#define AIM_VIS_TOL_X_PX      8      /* 水平命中/停转容差(px) */
+#define AIM_VIS_TOL_Y_PX      8      /* 垂直命中容差(px) */
+#define AIM_VIS_KP_X          0.60f  /* 水平: 像素误差->角速度 (°/s per px); 收敛慢调大/抖动调小 */
+#define AIM_VIS_KP_Y          0.12f  /* 垂直: 像素误差->俯仰修正量 (°/px, 比例非积分); 残差大调大/过冲调小 */
+#define AIM_VIS_WMAX_DPS      90.0f  /* 水平角速度限幅(°/s): 防满速甩头 + 视觉延迟下冲过靶 */
+#define AIM_VIS_PAN_SIGN     (+1.0f) /* 待标: err_x>0(靶偏右)该往哪转把靶拉回中心; 转反改 -1 */
+#define AIM_VIS_TILT_SIGN    (+1.0f) /* 待标: err_y>0(靶偏下)俯仰怎么修; 修反改 -1 */
+#define AIM_VIS_ELEV_CORR_MAX 20     /* 垂直视觉微调相对前馈的最大累计修正(°), 防积分跑飞 */
 
 /* ===== 运行模式(F4: 按键/串口选模式; IDLE 态 MODE 键循环或串口发'1'~'4', RUN 灯闪"模式号"次) =====
  * 1 = F1 自动巡迹一圈回 A 停车(≤30s)
@@ -594,6 +660,7 @@ void track_loop_step(void)
     /* 6) 统一航向误差 DeltaYaw(°, 左正) —— 本架构唯一的控制接口 */
     float yaw = imu_get_yaw();
     float dy;
+    uint8_t on_arc    = (uint8_t)(g_seg == 1u || g_seg == 3u);  /* r39: 弧段(前馈作用域) */
     uint8_t on_ladder = 0;
     if (g_seg == 0u) {
         dy = wrap180(g_datum_yaw - yaw);                /* A→B: 出发基准角 z */
@@ -612,21 +679,38 @@ void track_loop_step(void)
         /* 刚进弧就丢线(冲过线头): 保护窗内向弧内侧强拐找线(CTY 手法) */
         dy = LAP_CW ? -ARC_SEARCH_DEG : +ARC_SEARCH_DEG;
     } else {
-        dy = 0.0f;                                      /* 弧上短暂全白/失败帧: 保持直走 */
+        /* r39: 弧上丢线且强拐窗已过。旧行为 dy=0 等于"在 R=400 的弯道上直走", 是出弯的
+         * 最后一脚。现在 PD 项归零(没有测量就不猜偏差), 转向全交给下面的曲率前馈 ——
+         * 按标称曲率继续画弧, 等线自己回到阵列里。 */
+        dy = 0.0f;
     }
 
-    /* 7) SelfTurn PD -> 差速占空('P/p' 调弧线KP ±0.5, 'D/d' 调 KD ±1)。
-     * r32 段切换清 D 历史: dy 换源(航向↔查表↔强拐)瞬间差分无意义, 防单拍甩头。 */
+    /* 7) SelfTurn PD + r39 弧线曲率前馈 -> 差速占空('P/p' 调弧线KP ±0.5, 'D/d' 调 KD ±1)。
+     * r32 段切换清 D 历史: dy 换源(航向↔质心↔强拐)瞬间差分无意义, 防单拍甩头。
+     * r39 追加 on_ladder 翻转也清: 灰度每闪断一帧 dy 就在"质心"与"0"之间跳一次,
+     * 不清的话每次闪断都被 D 项当成真实的误差速率, 甩一拍方向。 */
     {
         static uint8_t s_seg_prev = 0;
-        if (g_seg != s_seg_prev) {
-            s_seg_prev = g_seg;
-            g_dyaw_prev = dy;
+        static uint8_t s_ladder_prev = 0;
+        if (g_seg != s_seg_prev || on_ladder != s_ladder_prev) {
+            s_seg_prev    = g_seg;
+            s_ladder_prev = on_ladder;
+            g_dyaw_prev   = dy;
         }
     }
     float kp_use = on_ladder ? g_kp_arc : g_track_kp;   /* r32 增益分家 */
     float diff_f = kp_use * dy + g_track_kd * (dy - g_dyaw_prev);
     g_dyaw_prev = dy;
+#if ARC_FF_EN
+    /* 曲率前馈: 弧段的恒定转向量由场地几何直接给, P 只负责纠偏(推导见 ARC_RADIUS_MM 处)。
+     * LAP_CW=1 两弧皆右转 => dy<0 方向 => 前馈取负。基速在线调('V/v')时自动跟随。 */
+    if (on_arc) {
+        float ff = (float)g_base_speed * WHEEL_TRACK_MM / (2.0f * ARC_RADIUS_MM);
+        diff_f += LAP_CW ? -ff : +ff;
+    }
+#else
+    (void)on_arc;
+#endif
     int diff = (int)clampf(diff_f, -(float)TURN_DIFF_LIM, (float)TURN_DIFF_LIM);
 
     /* 8) 输出: 开环占空差速(dy>0=左转=右轮加左轮减; 'V/v' 调基速占空 ±10) */
@@ -737,12 +821,97 @@ __attribute__((unused)) static int aim_refine_k230(float *pan_deg, float *tilt_d
 }
 
 /**
- * @brief 执行一次对靶(几何主 + K230 精修)并驱动云台
- * @return 1=命中; 0=未命中
+ * @brief 期望角速度(°/s) -> 连续舵机脉宽(us)。"角度环"标定的反解(见头部 AIM_CONT_* 说明)。
+ * @param omega_dps 期望角速度; 约定 >0 -> 脉宽>STOP, <0 -> 脉宽<STOP, |小|视为停。
+ * @return 下发脉宽(us), 已夹在 [600,2400] 与 STOP±MAX_OFF 内。STOP 取运行时 g_cont_stop_us。
+ * @note 死区 DEAD 作为前馈叠加: 只要 ω 非零就至少给 DEAD 偏移, 抵消舵机机械死区让指令真的产生转动。
+ */
+__attribute__((unused)) static uint32_t cont_omega_to_pulse(float omega_dps)
+{
+    if (omega_dps > -0.5f && omega_dps < 0.5f) {
+        return g_cont_stop_us;                 /* 期望≈0: 发停转脉宽保持 */
+    }
+    float mag = omega_dps < 0.0f ? -omega_dps : omega_dps;
+    float off = (float)AIM_CONT_DEAD_US + mag * AIM_CONT_KUS_PER_DPS;   /* 死区前馈 + 线性 */
+    if (off > (float)AIM_CONT_MAX_OFF_US) off = (float)AIM_CONT_MAX_OFF_US;
+    int32_t pulse = (int32_t)g_cont_stop_us + (omega_dps > 0.0f ? (int32_t)off : -(int32_t)off);
+    if (pulse < 600)  pulse = 600;             /* 与 servo_set_pulse_us 内部夹逻辑一致, 双保险 */
+    if (pulse > 2400) pulse = 2400;
+    return (uint32_t)pulse;
+}
+
+/**
+ * @brief 执行一次对靶并驱动云台
+ * @return 1=命中; 0=未命中/持续锁靶
  */
 static int aim_step_once(void)
 {
-#if AIM_FIXED_MODE
+#if AIM_VIS_MODE
+    /* r38 K230 视觉闭环: 水平连续舵机=视觉速度环, 垂直位置舵机=前馈105°+dy位置环。
+     * 角色对通道同 r37: AIM_CONT_CH=水平连续(速度), AIM_ELEV_CH=垂直位置(俯仰), 与命名相反。
+     * 恒返回 0 撑满 AIM_TIMEOUT_MS, 全程持续锁靶(激光亮足、录像清晰)。 */
+    static float   s_elev_cur  = 90.0f;   /* 垂直当前输出角(斜坡跟随, 防上电甩头) */
+    static float   s_elev_corr = 0.0f;    /* 垂直视觉累计微调(相对前馈 AIM_ELEV_DEG) */
+    static uint8_t s_hit       = 0;       /* 最近一拍是否命中(遥测/日后提前退出用) */
+    if (g_aim_timer == 0u) {              /* 入态第一拍: 复位斜坡与积分, 从中位重新起坡 */
+        s_elev_cur  = 90.0f;
+        s_elev_corr = 0.0f;
+        s_hit       = 0;
+    }
+
+    int16_t dx = 0, dy = 0;
+    uint8_t found = k230_get_aim(&dx, &dy);
+
+    if (found) {
+        /* --- 水平: 视觉速度环。像素误差 -> 期望角速度 -> 脉宽 --- */
+        float err_x = (float)dx - (float)AIM_AIMPOINT_DX0;
+        float omega = 0.0f;                /* 容差内保持 ω=0(发停转脉宽), 抑制中心抖动 */
+        if (err_x > (float)AIM_VIS_TOL_X_PX || err_x < -(float)AIM_VIS_TOL_X_PX) {
+            omega = clampf(AIM_VIS_PAN_SIGN * AIM_VIS_KP_X * err_x,
+                           -AIM_VIS_WMAX_DPS, AIM_VIS_WMAX_DPS);
+        }
+        servo_set_pulse_us(AIM_CONT_CH, cont_omega_to_pulse(omega));
+
+        /* --- 垂直: 前馈 AIM_ELEV_DEG + dy 比例位置修正(非积分!) ---
+         * ⚠ 位置舵机不能像水平那样积分: 本环 100Hz 跑, K230 只 ~30Hz, 同一 dy 会被读 3 拍;
+         *   若用 s_elev_corr += KP*dy 会 3 倍过积分 + 无反馈延迟下 windup, 一两拍就甩到 ±CORR_MAX
+         *   限幅并极限环振荡(code-review r38 实证)。位置舵机"每像素≈固定角度", 故直接用比例映射
+         *   corr = KP_Y*err_y 给绝对修正量(不累加), 斜坡限速平滑到位, 天生无 windup。
+         *   前馈 105° 已实测对准靶心 => 残差本就小, 比例残差可忽略。容差内清零回落纯前馈。 */
+        float err_y = (float)dy - (float)AIM_AIMPOINT_DY0;
+        if (err_y > (float)AIM_VIS_TOL_Y_PX || err_y < -(float)AIM_VIS_TOL_Y_PX) {
+            s_elev_corr = clampf(AIM_VIS_TILT_SIGN * AIM_VIS_KP_Y * err_y,
+                                 -(float)AIM_VIS_ELEV_CORR_MAX, (float)AIM_VIS_ELEV_CORR_MAX);
+        } else {
+            s_elev_corr = 0.0f;   /* 命中带内: 回落纯前馈, 不留残余偏置 */
+        }
+        s_hit = (err_x > -(float)AIM_VIS_TOL_X_PX && err_x < (float)AIM_VIS_TOL_X_PX &&
+                 err_y > -(float)AIM_VIS_TOL_Y_PX && err_y < (float)AIM_VIS_TOL_Y_PX) ? 1u : 0u;
+    } else {
+        /* 无视觉回退: 前 SWEEP_MS 做转向靶手势捕获目标, 之后停转; 拔摄像头也不卡死。 */
+        if (g_aim_timer < AIM_CONT_SWEEP_MS) {
+            servo_set_pulse_us(AIM_CONT_CH,
+                (uint32_t)((int)g_cont_stop_us + AIM_CONT_SWEEP_DIR * AIM_CONT_SWEEP_US));
+        } else {
+            servo_set_pulse_us(AIM_CONT_CH, g_cont_stop_us);
+        }
+        s_hit = 0;
+    }
+
+    /* 垂直目标 = 前馈 + 视觉微调; 斜坡跟随防甩头, servo_set_angle 内部再夹机械限位 */
+    float elev_tgt = (float)AIM_ELEV_DEG + s_elev_corr;
+    if (s_elev_cur < elev_tgt) {
+        s_elev_cur += AIM_ELEV_RAMP_DEG;
+        if (s_elev_cur > elev_tgt) s_elev_cur = elev_tgt;
+    } else if (s_elev_cur > elev_tgt) {
+        s_elev_cur -= AIM_ELEV_RAMP_DEG;
+        if (s_elev_cur < elev_tgt) s_elev_cur = elev_tgt;
+    }
+    servo_set_angle(AIM_ELEV_CH, (int)s_elev_cur);
+
+    (void)s_hit;                               /* 恒返回0持续锁靶; s_hit 保留供遥测/提前退出 */
+    return 0;
+#elif AIM_FIXED_MODE
     /* r37 固定指向 + 手势(水平轴=360°连续舵机, 无法定角; 详见头部常量组说明)。
      * 角色对通道: AIM_CONT_CH=水平连续(手势+停转), AIM_ELEV_CH=垂直位置(俯仰), 与命名相反。
      * 前 AIM_CONT_SWEEP_MS 慢转做"转过去瞄准"手势; 之后发停转脉宽 g_cont_stop_us 保持。 */
@@ -931,7 +1100,7 @@ void app_fsm_step(void)
         break;
 
     case APP_ST_AIM:
-        /* 瞄准: 整车停, 云台几何指向 + K230 精修。命中或超时离开。 */
+        /* 瞄准: 整车停, 云台 K230 视觉闭环锁靶(r38)。持续修正至 AIM_TIMEOUT_MS 超时离开。 */
         motor_stop_all();
         {
             int hit = aim_step_once();
