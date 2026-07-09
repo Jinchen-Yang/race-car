@@ -231,15 +231,26 @@ extern volatile uint32_t g_tick_ms;
 #define AIM_PAN_SIGN      (+1.0f)  /* (几何方案用)待标 */
 #define AIM_TILT_SIGN     (+1.0f)
 
-/* ===== r34 定点打靶·物理简化方案(用户拍板: 靶摆到光点处, 只做停车定点打靶) =====
- * 背景: 实装=水平360°连续舵机(无位置概念)+垂直180°位置舵机, 而题目说明4要求
- * 无摄像头完成作业 -> 360做主瞄轴不可行。规则只约束靶在"AB外侧50cm平行线"上,
- * 沿线位置自由 -> 固定指向, 现场把靶摆到光点落点。AIM_FIXED_MODE 置0可恢复
- * 几何解算方案(换装位置舵机到水平轴后用)。 */
+/* ===== 定点打靶方案 (r37: 水平轴实为 360° 连续舵机, 定角瞄准不可行 -> 固定指向 + 手势) =====
+ * ★本车物理接线与 PAN/TILT 命名相反(见 servo_gimbal_bringup.md 实测):
+ *     水平 360° 连续舵机 接在 SERVO_TILT/PA16 ('K' 键那路, 一直转);
+ *     垂直 180° 位置舵机 接在 SERVO_PAN /PA17 ('J' 键那路, 能定角)。
+ *   故本方案用"角色"宏点名通道, 别被 PAN/TILT 字面误导。
+ * 方案(用户拍板 2026-07-08): 进 AIM 时连续舵机朝靶侧慢转做"转过去瞄准"手势(样式B), 再发停转
+ *   脉宽保持; 垂直位置舵机斜坡抬到俯仰角定激光高度。恒返回 0 让 AIM 满 5s(激光亮足, 录像清晰)。
+ *   ⚠连续舵机开环无位置反馈: 单向手势每趟停点会累积漂移, 靶按"停稳后激光落点"摆; 多趟后手动回中。
+ * AIM_FIXED_MODE=0 可切回几何解算(换装水平位置舵机后用)。 */
 #define AIM_FIXED_MODE     1
-#define AIM_TILT_FIX_DEG   150   /* 待标: TILT 指向角(若舵机中位≈水平, 116=26°上仰理论值);
-                                  * 现场按"光点落在靶心高度"微调, 靶面每 1cm ≈ 0.84° */
-#define AIM_TILT_RAMP_DEG  2.0f  /* TILT 斜坡步进(°/10ms拍): ~0.13s 到位, 防满速甩头 */
+#define AIM_CONT_CH        SERVO_TILT  /* 水平 360° 连续舵机通道('K'键那个, 一直转的) */
+#define AIM_ELEV_CH        SERVO_PAN   /* 垂直 180° 位置舵机通道('J'键那个, 能定角的) */
+#define AIM_ELEV_DEG       105   /* 垂直俯仰目标角(送 AIM_ELEV_CH): 实测 105° 激光对齐靶心;
+                                  * 再微调靶面每 1cm≈0.84°(此处 1°≈1.2cm, 因走 SERVO_PAN 10-170 标度) */
+#define AIM_ELEV_RAMP_DEG  1.0f  /* 俯仰斜坡步进(°/10ms拍): 防满速甩头 */
+#define AIM_CONT_STOP_US   1495u /* 连续舵机停转脉宽: 实测 1495us 才真不转(此值=真中位)。
+                                  * 蠕转就 'G'/'g' 现场微调再写死。sweep 手势脉宽 = 此值 + DIR*SWEEP_US */
+#define AIM_CONT_SWEEP_US  255   /* 手势转速偏移: 255 使 sweep 脉宽=1495-255=1240us, 保住实测"距离正好"那档 */
+#define AIM_CONT_SWEEP_DIR (-1)  /* 手势方向: 停点 ± 此偏移选"转向靶"那侧; 转反了改成 (+1) */
+#define AIM_CONT_SWEEP_MS  305u  /* 进 AIM 后前多少 ms 做"转向靶"手势, 之后发停转脉宽保持 */
 
 /* ===== 运行模式(F4: 按键/串口选模式; IDLE 态 MODE 键循环或串口发'1'~'4', RUN 灯闪"模式号"次) =====
  * 1 = F1 自动巡迹一圈回 A 停车(≤30s)
@@ -336,6 +347,7 @@ static int   g_base_speed = BASE_SPEED;  /**< 巡迹基速 mm/s(运行时可调)
 static float g_heading_kp = HEADING_KP;  /**< 盲走航向锁 KP(串口 'H'/'h' ±0.5, 可为负) */
 static int   g_trim_duty  = DRIVE_TRIM_DUTY_R; /**< r24: 右轮占空配平('T'/'t' ±3, 夹±40) */
 static uint8_t g_aim_return_run = 0;/**< AIM 结束后回 RUN(F3 中途对靶)还是进 STOP(F2) */
+static uint32_t g_cont_stop_us = AIM_CONT_STOP_US; /**< r37: 水平连续舵机停转脉宽(串口 'G/g' 现场微调到不蠕转) */
 static int32_t g_run_beep_ms = 0;   /**< RUN 态过点声光剩余时长(ms), 非阻塞关断 */
 
 /* ============================================================================
@@ -704,25 +716,32 @@ __attribute__((unused)) static int aim_refine_k230(float *pan_deg, float *tilt_d
 static int aim_step_once(void)
 {
 #if AIM_FIXED_MODE
-    /* r34 物理简化方案(用户拍板 2026-07-07): 现有硬件=水平360连续舵机(无位置概念,
-     * 题目说明4又禁视觉主导作业) -> 放弃解算指向, 改"固定指向 + 把靶摆到光点处"
-     * (规则只约束靶在AB外侧50cm平行线上, 沿线位置自由, 摆好后比赛期间不动)。
-     * PAN 恒发 90 = 360舵机停转脉冲(1.5ms; ⚠仍建议扎带把转头物理锁死防蠕转);
-     * TILT(180位置舵机)从中位斜坡抬到定角 = 可见的"自动调整云台姿态+指向"动作,
-     * 满足 F2 文本。恒返回0让 AIM 保持满5秒(激光在靶上亮足, 录像清晰), 超时收尾。 */
-    static float s_tilt_cur = 90.0f;
+    /* r37 固定指向 + 手势(水平轴=360°连续舵机, 无法定角; 详见头部常量组说明)。
+     * ★角色对通道: AIM_CONT_CH=水平连续(手势+停转), AIM_ELEV_CH=垂直位置(俯仰), 与命名相反!
+     *  - 前 AIM_CONT_SWEEP_MS: 连续舵机朝靶侧慢转 = 可见的"转过去瞄准"手势(样式B);
+     *    之后发停转脉宽 g_cont_stop_us 保持(现场 'G/g' 微调到不蠕转)。
+     *  - 垂直位置舵机从中位斜坡抬到 AIM_ELEV_DEG, 定俯仰(激光高度)。
+     *  - 恒返回 0 让 AIM 满 5s(激光亮足, 录像清晰), 超时收尾。 */
+    static float s_elev_cur = 90.0f;
     if (g_aim_timer == 0u) {
-        s_tilt_cur = 90.0f;                    /* 入态第一拍: 从中位重新起坡 */
+        s_elev_cur = 90.0f;                    /* 入态第一拍: 俯仰从中位重新起坡 */
     }
-    if (s_tilt_cur < (float)AIM_TILT_FIX_DEG) {
-        s_tilt_cur += AIM_TILT_RAMP_DEG;
-        if (s_tilt_cur > (float)AIM_TILT_FIX_DEG) s_tilt_cur = (float)AIM_TILT_FIX_DEG;
-    } else if (s_tilt_cur > (float)AIM_TILT_FIX_DEG) {
-        s_tilt_cur -= AIM_TILT_RAMP_DEG;
-        if (s_tilt_cur < (float)AIM_TILT_FIX_DEG) s_tilt_cur = (float)AIM_TILT_FIX_DEG;
+    /* 垂直: 斜坡到俯仰角 */
+    if (s_elev_cur < (float)AIM_ELEV_DEG) {
+        s_elev_cur += AIM_ELEV_RAMP_DEG;
+        if (s_elev_cur > (float)AIM_ELEV_DEG) s_elev_cur = (float)AIM_ELEV_DEG;
+    } else if (s_elev_cur > (float)AIM_ELEV_DEG) {
+        s_elev_cur -= AIM_ELEV_RAMP_DEG;
+        if (s_elev_cur < (float)AIM_ELEV_DEG) s_elev_cur = (float)AIM_ELEV_DEG;
     }
-    servo_set_angle(SERVO_PAN,  90);           /* 360舵机: 停转脉冲 */
-    servo_set_angle(SERVO_TILT, (int)s_tilt_cur);
+    servo_set_angle(AIM_ELEV_CH, (int)s_elev_cur);
+    /* 水平: 前 SWEEP_MS 慢转手势(转向靶), 之后发停转脉宽保持 */
+    if (g_aim_timer < AIM_CONT_SWEEP_MS) {
+        servo_set_pulse_us(AIM_CONT_CH,
+            (uint32_t)((int)g_cont_stop_us + AIM_CONT_SWEEP_DIR * AIM_CONT_SWEEP_US));
+    } else {
+        servo_set_pulse_us(AIM_CONT_CH, g_cont_stop_us);
+    }
     return 0;                                  /* 不提前退出, 满5s展示 */
 #else
     float pan, tilt;
@@ -891,13 +910,13 @@ void app_fsm_step(void)
     case APP_ST_AIM:
         /* 瞄准: 整车停, 云台几何指向 + K230 精修。命中或超时离开。 */
         motor_stop_all();
-        if (entered) {
-            /* 限制⑥: 舵机轨平时断电, 对靶作业期间才供电(r15 补, 此前全工程无人开轨=
-             * MOS 开关装上后会对着断电舵机瞄准)。现红线直连 5V 时本调用无实际效果。 */
-            servo_rail_enable(1);
-        }
         {
             int hit = aim_step_once();
+            if (entered) {
+                /* 先写好目标 PWM 再开舵机轨, 避免上电瞬间按旧角度大幅扫动(限制⑥: 舵机轨平时
+                 * 断电, 对靶期间才供电; 现红线直连 5V 时本调用无实际效果, 割接 MOS 后才生效)。 */
+                servo_rail_enable(1);
+            }
             g_aim_timer += APP_FSM_DT_MS;
             if (hit || g_aim_timer >= AIM_TIMEOUT_MS) {
                 servo_rail_enable(0);   /* 离开对靶 -> 舵机轨断电(F3 续跑/F2 停车都关) */
@@ -1051,6 +1070,21 @@ void app_tune_step(char which, int dir)
 int app_get_trim(void)
 {
     return g_trim_duty;   /* 供 VOFA ch23 / '?' 回显; 调好后把值写死进 DRIVE_TRIM_DUTY_R */
+}
+
+void app_aim_stop_trim(int dir)
+{
+    /* r37: 现场微调水平 360° 连续舵机的"停转脉宽"到纹丝不动(消蠕转), 立即写入通道可看效果。
+     * 用法: 先 'O' 上电舵机轨, 反复 'G'/'g' 直到该舵机停住; 把回显的 us 写死进 AIM_CONT_STOP_US 再烧。
+     * 夹 1300~1700us(连续舵机停点必在 1.5ms 附近, 出这范围多半是方向/接线错)。 */
+    if (dir > 0 && g_cont_stop_us < 1700u)      g_cont_stop_us += 5u;
+    else if (dir < 0 && g_cont_stop_us > 1300u) g_cont_stop_us -= 5u;
+    servo_set_pulse_us(AIM_CONT_CH, g_cont_stop_us);
+}
+
+uint32_t app_get_aim_stop_us(void)
+{
+    return g_cont_stop_us;   /* 供 'G/g' 回显; 调好写死进 AIM_CONT_STOP_US */
 }
 
 void app_tune_get(float *kp, float *kd, int *base, float *hkp)
