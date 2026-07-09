@@ -44,11 +44,16 @@ START 起跑;运动中任意键=急停;ESTOP 下 2s 内三连按 START 软清障
 
 | 参数 | 值 | 含义 |
 |---|---|---|
-| TRACK_KP / TRACK_KD | **6.0 / 2.0** | SelfTurn PD(占空差/°) |
-| BASE_SPEED | **150** | 巡航占空(≈300mm/s;r25 起是占空不是 mm/s) |
+| TRACK_KP / TRACK_KD | **6.0 / 2.0** | SelfTurn PD(占空差/°);TRACK_KP 只用于直线航向保持 |
+| TRACK_KP_ARC | **3.5** | r32 增益分家:弧线质心专用 KP(`P/p` 调的是它);曾用 6.0,弧上激出 S 型极限环 |
+| BASE_SPEED | **170** | 巡航占空(r25 起是占空不是 mm/s)。⚠r39 起弧线曲率前馈 ∝ base,改基速会同步改变前馈量 |
+| DRIVE_TRIM_DUTY_R | **5** | 右轮占空配平(`T/t` 调) |
+| ARC_FF_EN / ARC_RADIUS_MM / WHEEL_TRACK_MM | **1 / 400.0 / 140.0** | r39 弧线曲率前馈:`ff = base·track/(2R)`。⚠轮距 140 为**估值**,实测后回填 |
 | SEG_LINE_TH / SEG_BLANK_TH | 8 / 16 | 认线≈5帧 / 认空白≈16帧(勿轻动:调松到 63 曾致误触发链) |
 | START_PROTECT_MS | 1500 | 起步 1.5s 无视灰度(摆车须离胶带 ≥50cm) |
-| 每圈重锚限幅 | ±10° | 模式 4 专用 |
+| 每圈重锚限幅 | ±10° | 模式 4 专用;r39 起是纯陀螺漂移的**唯一**长期基准(模式 1/3 单圈内无任何修正) |
+
+> r39 弧线整定判据(与基速无关):弧上稳态时 CSV 的 `gray_err` 应落回 0 附近(r38 及以前常驻 ≈+71,线骑阵列外缘)。仍偏正=`WHEEL_TRACK_MM` 估小了,偏负=估大了,按 `|gray_err|` 比例回填。
 
 ## 4. 构建/烧录/调试
 
@@ -56,7 +61,7 @@ START 起跑;运动中任意键=急停;ESTOP 下 2s 内三连按 START 软清障
 - **水印制度**:每次烧录后看 boot 串口横幅的 rN 版本号,与预期不符=烧了个寂寞
 - **Serial Studio 临时灰度排障模式**:`empty.c` 里 `SERIAL_STUDIO_CSV=1` 时,串口每 50ms 输出纯数字 CSV: `ms,state,gray_err,lost,fresh,ok_delta,fail_delta,raw_or_neg1,gray_hits,line_ok,gray_min_hits,aim_stop_us,trim,arc_kp_x100,kd_x100,arc_scale_x1000,base,line_kp_x100,dy,seg,turn_diff,left_duty,right_duty,nodata,protect_ms,startprot_ms`。Serial Studio 选 XDS110 串口、115200、Quick Plot 即可;重点看 `fail_delta` 是否随晃线冒尖、`raw_or_neg1` 白地是否约 255；若 `fresh=0` 则 `raw_or_neg1=-1`,表示原始字节无效。`gray_hits` 是本帧黑点数,`line_ok=1` 才会被循迹当真线; `G/g` 调 `gray_min_hits` 抗阴影,`Y/y` 调水平连续舵机停转脉宽 `aim_stop_us`。CSV 模式下 `P/p D/d A/a V/v H/h T/t G/g Y/y O/o` 字符调参静默生效,参数列会跟着跳变;突然右转时看 `seg` 是否提前从 0 跳到 1、`turn_diff` 是否为负、左右占空是否拉开。
 - **VOFA+**:`SERIAL_STUDIO_CSV=0` 时恢复 JustFloat 24 通道。要点通道:I0 状态机 · I10 灰度质心 · I11 丢线 · I15 灰度原始字节(白地=255) · I13/I14 灰度 I2C 成败计数 · I20 当前段目标航向 · I21 转向量 · I23 右轮配平
-- **命令台**(VOFA 发送框):`1~4` 模式 · `s` 启动 · `x` 急停 · `r` STOP 回待机/ESTOP 三连确认 · `P/p` 弯道KP±0.5 · `D/d` KD±1 · `A/a` 灰度质心到角度比例±0.01 · `V/v` 基速占空±10 · `H/h` 直线航向KP±0.5 · `T/t` 右轮配平±3 · `G/g` 灰度门槛±1 · `O/o` 舵机轨上/下电 · `C` 云台中位 · `J/j` PAN±1° · `K/k` TILT±5° · `Y/y` 连续舵机停转脉宽±5us · `?` 回显+帮助。
+- **命令台**(VOFA 发送框):`1~4` 模式 · `s` 启动 · `x` 急停 · `r` STOP 回待机/ESTOP 三连确认 · `P/p` 弯道KP±0.5 · `D/d` KD±1 · `A/a` 灰度质心到角度比例±0.01 · `V/v` 基速占空±10 · ~~`H/h` 直线航向KP~~(**死旋钮**:`g_heading_kp` 属 r20 盲走架构,r25 段状态机上线后无人引用,调它只改回显不改行为;直线 KP 是定版 `TRACK_KP=6.0`,不在线调) · `T/t` 右轮配平±3 · `G/g` 灰度门槛±1 · `O/o` 舵机轨上/下电 · `C` 云台中位 · `J/j` PAN±1° · `K/k` TILT±5° · `Y/y` 连续舵机停转脉宽±5us · `?` 回显+帮助。
 - ⚠ 串口在线调的参数**断电即失**,定版值必须写回 `app.c` 常量再烧
 
 ### 舵机/云台快调

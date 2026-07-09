@@ -83,8 +83,10 @@ extern volatile uint32_t g_tick_ms;
 /* --- r39 弧线曲率前馈(恢复 r19 TRACK_FF_GAIN 的思想, 改由场地几何直接给) ---
  * 病("弧上太肉, 出弯"): 弧段是纯 PD 打在灰度质心上。R=400mm 的弧要求一个恒定的转向量,
  *   纯 P 只能靠"一直保持一个偏差"把它顶出来 —— 稳态偏差不可能为零, 且正比于车速:
- *     diff_ss = base·track/(2R) = 26.25 @base=150   (对象增益 G 约掉, 与电池电压无关)
- *     稳态质心 = diff_ss/(g_kp_arc·g_arc_err_to_deg) = 26.25/0.42 ≈ 62 ≈ 0.6 个探头间距
+ *     diff_ss = base·track/(2R)                     (左右电机增益 G 约掉, 故与电池电压弱相关)
+ *     稳态质心 = diff_ss/(g_kp_arc·g_arc_err_to_deg)
+ *     算例 @base=170(当前值): diff_ss=29.75, 稳态质心≈71 ≈0.7 个探头间距。两者都 ∝ base,
+ *     'V' 每加 10 稳态质心就多约 4 个单位 —— 所以提基速会直接把线往阵列边缘推。
  *   线常驻阵列外侧(弯道外侧) -> gray_hits 掉到 1 -> line_ok=0 -> 落进 dy=0 分支在 R=400
  *   的弯道上直走 -> 出弯。再攒够 SEG_BLANK_TH(16帧≈320ms) 还会伪造一个 C 节点, 段状态机
  *   1→2 切到绝对航向保持(z+180), 车就彻底开出去了。
@@ -95,14 +97,31 @@ extern volatile uint32_t g_tick_ms;
  *   故前馈是个常数, 比 r19 的"快慢平均差"估计法更直接、更不怕噪声。
  * 推导: 维持半径 R 需 ω=v/R; 两轮速差 Δv=ω·track; diff 产生 Δv=2·diff·G; v=base·G
  *       => diff_ff = base·track/(2R)
- * 副作用(有意为之): 前馈在整个弧段生效, 含 line_ok=0 那一拍 —— 丢线时 PD 归零(没有测量就
- *   不猜偏差), 但车按标称曲率继续画弧等线回来, 而不是直走。这堵上了上面那个 dy=0 的洞。
+ * 作用域: 只在"弧上且认到线"(on_ladder)时加, 不覆盖弧上丢线那一拍。曾想顺手拿它堵掉
+ *   dy=0 那个洞(丢线时按标称曲率继续画弧), 但那会打坏 C/A 的出弧 —— 弧在 C 真的终止,
+ *   而出弧判据正是"漏积分攒够 SEG_BLANK_TH=16 帧(320ms)才认空白"。C 处切线恰为 C→D 直线
+ *   方向, 故 dy=0 在 C 是对的(沿切线直走, 零注入); 若那 320ms 继续画弧, 会多转
+ *   ω·0.32s ≈ 15.6°(@base=170, ω=v/R≈48.7°/s)、横向甩出 ≈R(1-cos15.6°) ≈ 15mm,
+ *   再交给毫无横向反馈的直线段一路带到 D。
+ *   而弧中丢线的根因本就是上面这个稳态偏差, 前馈一上即消, 不必冒这个险。
  * ⚠ WHEEL_TRACK_MM 是估值(与 r39 删掉的 mpu6050.c IMU_WHEEL_TRACK_MM 同源), 前馈量正比于它。
+ *   但本方案对该估值不敏感: 只要 0 < ff < 2·ff_理想(即真实轮距 > 70mm), |稳态偏差| 就严格
+ *   小于改前。例: track 真值 110 而估 140(高 27%), 残余 diff=6.4 -> 稳态质心≈15(内侧),
+ *   仍比改前的 71(外侧)小 4.7 倍。故先上车再标定是安全的, 不是"未验证就发车"。
  *   实测法: 车原地转 N 圈, 读右轮里程 Δs 与 IMU 累计转角 Δyaw, track = Δs·360/(Δyaw·π)。
- *   验证判据: 弧上稳态时 CSV 的 gray_err 应落回 0 附近(改前常驻 ≈+62), ch21 差速常驻 ≈-26。 */
+ *   验证判据(与 base 无关): 弧上稳态时 CSV 的 gray_err 应落回 0 附近(改前常驻 ≈+71)。
+ *   仍明显偏正 = track 估小了(前馈给少); 偏负 = 给多了 —— 按 |gray_err| 比例回填 track。 */
 #define ARC_FF_EN         1      /* 0 = 回退到 r38 纯 PD 行为(一键对照, 不必翻 git) */
 #define ARC_RADIUS_MM     400.0f /* 场地半圆弧半径(题目 Figure1: R=40cm) */
 #define WHEEL_TRACK_MM    140.0f /* ⚠估值! 左右轮距(mm), 实测后回填 —— 前馈量正比于它 */
+#define ARC_FF_HOLD_FRAMES 3     /* 弧上丢线后前馈再保持几帧(20ms/帧)。
+                                  * 为何非零: 前馈若只在认到线的帧生效, 灰度一闪断前馈就掉 0,
+                                  * 平均转向量被稀释成欠转 -> 线更往弯道外跑 -> 更容易丢 -> 正反馈,
+                                  * 且在闪断频率上给电机一个 ±ff 的方波(≈30 占空)。
+                                  * 为何是 3 而不是更大: 出弧(C/A)靠"连续空白 SEG_BLANK_TH=16 帧"认,
+                                  * 保持窗越长, 过了 C 还多画的弧越多。3 帧=60ms, @base=170(ω≈48.7°/s)
+                                  * 只多转 2.9°、横向 ≈R(1-cos2.9°)≈0.5mm, 可忽略; 而灰度闪断
+                                  * 典型 1~2 帧(见 TRACK_ACQ_N 的 r19 审计), 正好被覆盖。 */
 
 /* --- r25 段状态机(CTY Task4StateUpdate 移植) --- */
 #define LAP_CW            1      /* 题目正式路线 A→B 先行 = 顺时针圈(两弧皆右转); 反向跑改0 */
@@ -153,14 +172,10 @@ extern volatile uint32_t g_tick_ms;
                                   * 旧逻辑单帧即解锁+再丢线重锁, 把首锁(带外推的好值)秒换成
                                   * 冻结的 fast 裸值, 且 online 计时永远到不了 600ms —— 外推
                                   * 在唯一需要它的地方被自我缴械。闪断期间沿用原锁定继续走。 */
-#define TRACK_FF_GAIN      4.6f  /* r19 弧上曲率前馈: turn_ff = 增益×(fast-slow)。
-                                  * 推导: ω̂(°/s)=(fast-slow)/(τs-τf)=d/0.267s;
-                                  * turn_ff(mm/s)=ω̂·(π/180)·(轮距/2≈70mm) ≈ 4.58×d。
-                                  * 作用: P 外环维持弧上 43°/s 需稳态偏差≈131 -> 线骑传感器
-                                  * 边缘(闪断/提前掉线的总根源); 前馈接管稳态转向后 err_ss→0,
-                                  * 线回传感器中央, 能跟到几何末端。直线段 d≈0 自动归零。
-                                  * ⚠轮距 140mm 为估值, 实测后回填(增益∝轮距)。 */
-#define TRACK_FF_LIM      80.0f  /* 前馈限幅(mm/s): 防快慢平均差噪声放大 */
+/* (r19 的 TRACK_FF_GAIN=4.6f / TRACK_FF_LIM=80.0f 曲率前馈已于 r39 删除: 那版靠"快慢航向
+ *  平均之差"估计 ω̂, 依赖 r25 一并退役的滑动平均; 且自 r25 起两宏就无人引用, 空占位置。
+ *  它的核心结论"P 外环维持弧上 43°/s 需稳态偏差≈131 -> 线骑传感器边缘 -> 前馈接管稳态转向
+ *  后 err_ss→0, 线回传感器中央"完全成立, 由头部 ARC_FF_EN 用场地几何(base·track/2R)重新实现。) */
 
 /* ===== r20 驱动架构切换: 编码器出局, 开环占空 + 陀螺/灰度差速 =====
  * 台架实锤(2026-07-05): 左编码器间歇无信号(测速读零→保险丝正确ESTOP), 右编码器
@@ -414,7 +429,11 @@ static float g_kp_arc     = TRACK_KP_ARC;/**< r32: 弧线查表 KP('P/p' 在线�
 static float g_track_kd   = TRACK_KD;    /**< SelfTurn KD(运行时可调) */
 static float g_arc_err_to_deg = ARC_ERR_TO_DEG; /**< 弧线灰度质心->等效角度比例('A/a' 在线调) */
 static int   g_base_speed = BASE_SPEED;  /**< 巡迹基速 mm/s(运行时可调) */
-static float g_heading_kp = HEADING_KP;  /**< 盲走航向锁 KP(串口 'H'/'h' ±0.5, 可为负) */
+static float g_heading_kp = HEADING_KP;  /**< ⚠死变量(r39 核实): 仅被 'H/h' 写入与 '?' 回显,
+                                          * track_loop_step 从不读它 —— 它属于 r20 盲走架构,
+                                          * r25 段状态机上线后就断了连接。直线航向 KP 实为定版
+                                          * g_track_kp(TRACK_KP=6.0), 不在线调。调 'H/h' 只会改
+                                          * 回显值、给现场一个"我在调"的错觉。README §4 已标注。 */
 static int   g_trim_duty  = DRIVE_TRIM_DUTY_R; /**< r24: 右轮占空配平('T'/'t' ±3, 夹±40) */
 static uint8_t g_aim_return_run = 0;/**< AIM 结束后回 RUN(F3 中途对靶)还是进 STOP(F2) */
 static uint32_t g_cont_stop_us = AIM_CONT_STOP_US; /**< 水平连续舵机停转脉宽('Y/y' 现场微调到不蠕转) */
@@ -660,12 +679,16 @@ void track_loop_step(void)
     /* 6) 统一航向误差 DeltaYaw(°, 左正) —— 本架构唯一的控制接口 */
     float yaw = imu_get_yaw();
     float dy;
-    uint8_t on_arc    = (uint8_t)(g_seg == 1u || g_seg == 3u);  /* r39: 弧段(前馈作用域) */
-    uint8_t on_ladder = 0;
+    uint8_t on_ladder = 0;   /* 弧上且认到线: 弧线 KP 的作用域 */
+    /* r39: dy 的来源标签。D 项只在"同一个来源内"连续, 换源那一拍的差分是伪信号。
+     * 0=直线绝对航向 1=弧线灰度质心 2=弧内强拐搜索 3=弧上丢线直走 */
+    uint8_t dy_src;
     if (g_seg == 0u) {
         dy = wrap180(g_datum_yaw - yaw);                /* A→B: 出发基准角 z */
+        dy_src = 0u;
     } else if (g_seg == 2u) {
         dy = wrap180(g_datum_yaw + 180.0f - yaw);       /* C→D: z+180(反向) */
+        dy_src = 0u;
     } else if (g_gray_line_ok_dbg) {
         /* 弧上循线: 用连续质心值(gray_get_error 已在上方调用)替代离散查表,
          * 消除 ±5/15/25/40° 台阶跳变 → PD 输出连续平滑 → 车不抖。
@@ -675,41 +698,64 @@ void track_loop_step(void)
         dy = -(float)centroid * g_arc_err_to_deg;
         dy = clampf(dy, -ARC_ERR_DEG_LIM, ARC_ERR_DEG_LIM);
         on_ladder = 1;
+        dy_src = 1u;
     } else if (g_protect_ms > 0u) {
         /* 刚进弧就丢线(冲过线头): 保护窗内向弧内侧强拐找线(CTY 手法) */
         dy = LAP_CW ? -ARC_SEARCH_DEG : +ARC_SEARCH_DEG;
+        dy_src = 2u;
     } else {
-        /* r39: 弧上丢线且强拐窗已过。旧行为 dy=0 等于"在 R=400 的弯道上直走", 是出弯的
-         * 最后一脚。现在 PD 项归零(没有测量就不猜偏差), 转向全交给下面的曲率前馈 ——
-         * 按标称曲率继续画弧, 等线自己回到阵列里。 */
+        /* 弧上全白/失败帧且强拐窗已过: PD 归零(没有测量就不猜偏差)。
+         * 转向在 ARC_FF_HOLD_FRAMES 帧内仍由曲率前馈托着(按标称曲率续弧等线回来),
+         * 超时则前馈也撤掉 = 沿切线直走 —— 这正是 C/A 出弧需要的行为(C 处切线即 C→D 方向)。
+         * 为何不无限续弧: 出弧判据是"连续空白 SEG_BLANK_TH=16 帧", 续太久会多画弧甩出横向
+         * 偏差, 而直线段没有横向反馈, 会一路带到下一个节点。 */
         dy = 0.0f;
+        dy_src = 3u;
     }
 
-    /* 7) SelfTurn PD + r39 弧线曲率前馈 -> 差速占空('P/p' 调弧线KP ±0.5, 'D/d' 调 KD ±1)。
-     * r32 段切换清 D 历史: dy 换源(航向↔质心↔强拐)瞬间差分无意义, 防单拍甩头。
-     * r39 追加 on_ladder 翻转也清: 灰度每闪断一帧 dy 就在"质心"与"0"之间跳一次,
-     * 不清的话每次闪断都被 D 项当成真实的误差速率, 甩一拍方向。 */
+    /* 7) 曲率前馈作用域: 弧段内, 认到线时全额生效; 丢线后再保持 ARC_FF_HOLD_FRAMES 帧,
+     * 覆盖灰度闪断(否则前馈被闪断稀释成欠转, 线更往外跑 -> 更易丢 -> 正反馈)。 */
+    uint8_t on_arc = (uint8_t)(g_seg == 1u || g_seg == 3u);
+    static uint8_t s_arc_lost = 0;      /* 弧上连续"未认到线"的帧数 */
+    if (!on_arc || on_ladder) {
+        s_arc_lost = 0;
+    } else if (s_arc_lost < 0xFFu) {
+        s_arc_lost++;
+    }
+    uint8_t ff_on = (uint8_t)(on_arc && s_arc_lost <= ARC_FF_HOLD_FRAMES);
+
+    /* 8) SelfTurn PD + 曲率前馈 -> 差速占空('P/p' 调弧线KP ±0.5, 'D/d' 调 KD ±1)。
+     * 换源清 D 历史(r32 只按 g_seg 判, r39 改按 dy_src): dy 在"航向/质心/强拐/丢线"之间
+     * 换源那一拍, 差分是伪信号。r32 漏掉的一条边: 强拐窗到期而线仍未找回时, 分支 2→3、
+     * g_seg 与 on_ladder 都没变, dy 却从 ∓50° 跳到 0 —— D 项吃进 kd·50 = +100 占空,
+     * 在右弯里给一记满舵左打, 恰好发生在车最需要稳住找线的时候。按 dy_src 判就堵上了。 */
     {
         static uint8_t s_seg_prev = 0;
-        static uint8_t s_ladder_prev = 0;
-        if (g_seg != s_seg_prev || on_ladder != s_ladder_prev) {
-            s_seg_prev    = g_seg;
-            s_ladder_prev = on_ladder;
-            g_dyaw_prev   = dy;
+        static uint8_t s_src_prev = 0;
+        if (g_seg != s_seg_prev || dy_src != s_src_prev) {
+            s_seg_prev  = g_seg;
+            s_src_prev  = dy_src;
+            g_dyaw_prev = dy;
         }
     }
     float kp_use = on_ladder ? g_kp_arc : g_track_kp;   /* r32 增益分家 */
     float diff_f = kp_use * dy + g_track_kd * (dy - g_dyaw_prev);
     g_dyaw_prev = dy;
 #if ARC_FF_EN
-    /* 曲率前馈: 弧段的恒定转向量由场地几何直接给, P 只负责纠偏(推导见 ARC_RADIUS_MM 处)。
-     * LAP_CW=1 两弧皆右转 => dy<0 方向 => 前馈取负。基速在线调('V/v')时自动跟随。 */
-    if (on_arc) {
+    /* 弧上恒定转向量由场地几何直接给, P 只负责纠偏(推导见头部 ARC_FF_EN)。
+     * LAP_CW=1 两弧皆右转 => 需要 dy<0 方向的差速 => 前馈取负(与 ARC_SEARCH_DEG 同号, 可互证)。
+     * 基速 'V/v' 在线调时前馈自动跟随(ff ∝ base)。
+     * 新平衡点: diff_f = kp·dy - ff = -ff  =>  dy=0  =>  稳态质心 0, 线回阵列中央。
+     * ⚠限幅不再对称: dy 夹 ±45 且 kp_arc·45=157.5, 叠上 -ff 后, 右转仍能顶到 -150,
+     *   左转(纠正切内道)上限降到 157.5-ff = 127.75@base170 / 105@base300。对应偏航率
+     *   仍有 ≈209/172 °/s, 远高于弧线所需的 48.7/86 °/s, 有余量; 但基速越高余量越薄,
+     *   'V' 调到 250 以上时注意弧上是否出现单侧纠偏乏力。 */
+    if (ff_on) {
         float ff = (float)g_base_speed * WHEEL_TRACK_MM / (2.0f * ARC_RADIUS_MM);
         diff_f += LAP_CW ? -ff : +ff;
     }
 #else
-    (void)on_arc;
+    (void)ff_on;
 #endif
     int diff = (int)clampf(diff_f, -(float)TURN_DIFF_LIM, (float)TURN_DIFF_LIM);
 
