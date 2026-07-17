@@ -1,0 +1,2 @@
+# 既有上下文使用 Markdown 行尾双空格表示强制换行；保留原文。
+备赛/PROJECT_CONTEXT.md whitespace=-trailing-space

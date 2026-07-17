@@ -1,0 +1,12 @@
+# 构建产物与 IDE 缓存(可再生, 不入库)
+Debug/
+.metadata/
+*.o
+*.d
+*.out
+*.map
+# CCS Theia 工作区缓存
+.theia/
+# 遥测录制(测试数据, 可再采, 不入库)
+capture_*.bin
+capture_*.csv
