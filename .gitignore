@@ -1,12 +1,26 @@
-# 构建产物与 IDE 缓存(可再生, 不入库)
+# 本机与编辑器状态
+.DS_Store
+.venv/
+.theia/
+.claude/worktrees/
+
+# 临时检查与构建产物
+tmp/
 Debug/
-.metadata/
+build/
+dist/
 *.o
 *.d
 *.out
 *.map
-# CCS Theia 工作区缓存
-.theia/
-# 遥测录制(测试数据, 可再采, 不入库)
+*.bin
+
+# 经验证并带校验值的题目发布包允许显式入库
+!problems/*/release/*.out
+!problems/*/release/*.map
+!problems/*/release/*.bin
+!problems/*/release/*.hex
+
+# 运行数据默认不直接入库；经筛选的证据放到 problems/<题目>/evidence/
 capture_*.bin
 capture_*.csv
